@@ -1,0 +1,80 @@
+[workspace]
+resolver = "2"
+exclude = ["fuzz", "third_party/fatfs"]
+members = [
+    "core/vc-types",
+    "core/vc-format",
+    "core/vc-crypto",
+    "core/vc-io",
+    "core/vc-fs",
+    "core/norse-exfat",
+    "core/vault-core",
+    "core/vault-ffi",
+    "core/vaultpony-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/norsehorse-dev/vaultponycore"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+vc-types = { path = "core/vc-types" }
+vc-format = { path = "core/vc-format" }
+vc-crypto = { path = "core/vc-crypto" }
+vc-io = { path = "core/vc-io" }
+vc-fs = { path = "core/vc-fs" }
+norse-exfat = { path = "core/norse-exfat" }
+vault-core = { path = "core/vault-core" }
+
+# Crypto (RustCrypto) — versions pinned via Cargo.lock, --locked everywhere
+aes = { version = "0.8", features = ["zeroize"] }
+serpent = { version = "0.5", features = ["zeroize"] }
+twofish = { version = "0.7", features = ["zeroize"] }
+camellia = { version = "0.1", features = ["zeroize"] }
+kuznyechik = { version = "0.8", features = ["zeroize"] }
+xts-mode = "0.5"
+whirlpool = "0.10"
+sha2 = "0.10"
+blake2 = "0.10"
+streebog = "0.10"
+pbkdf2 = "0.12"
+hmac = "0.12"
+cipher = "0.4"
+digest = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+
+# Filesystems
+# chrono feature off: we consume fatfs's raw DateTime directly, and the
+# vendored copy's chrono glue trips deprecation warnings as a path dep.
+fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
+ntfs = "0.4"
+
+# fatfs is patched in-tree until upstream releases the dot-entry LFN fix
+# (see third_party/fatfs/VAULTPONY.md). Keep the patch adjacent to the dep.
+
+# Misc
+thiserror = "2"
+log = "0.4"
+crc32fast = "1"
+
+# All dependencies build optimized even in dev profile — 500k PBKDF2
+# iterations through an unoptimized hash stack (including indirect crates
+# like block-buffer) makes every debug unlock and fixture test crawl.
+# Workspace crates themselves stay at opt-level 0 for fast rebuilds.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = "debuginfo"
+panic = "abort"
+codegen-units = 1
+
+[patch.crates-io]
+fatfs = { path = "third_party/fatfs" }

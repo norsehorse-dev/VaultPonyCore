@@ -1,0 +1,22 @@
+[package]
+name = "vaultpony-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+vc-format = { path = "../core/vc-format" }
+vc-types = { path = "../core/vc-types" }
+
+[[bin]]
+name = "header_parse"
+path = "fuzz_targets/header_parse.rs"
+test = false
+doc = false
+bench = false
+
+# exFAT directory-set parsing joins here in P2 (doc §13).

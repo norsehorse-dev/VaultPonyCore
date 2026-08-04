@@ -1,0 +1,20 @@
+[package]
+name = "vc-format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vc-types = { workspace = true }
+vc-crypto = { workspace = true }
+vc-io = { workspace = true }
+crc32fast = { workspace = true }
+zeroize = { workspace = true }
+log = { workspace = true }
+getrandom = "0.2"
+
+[dev-dependencies]
+vc-types = { workspace = true }
+crc32fast = { workspace = true }

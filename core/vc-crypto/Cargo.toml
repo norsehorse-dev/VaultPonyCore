@@ -1,0 +1,25 @@
+[package]
+name = "vc-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+vc-types = { workspace = true }
+aes = { workspace = true }
+serpent = { workspace = true }
+twofish = { workspace = true }
+camellia = { workspace = true }
+kuznyechik = { workspace = true }
+xts-mode = { workspace = true }
+whirlpool = { workspace = true }
+sha2 = { workspace = true }
+blake2 = { workspace = true }
+streebog = { workspace = true }
+pbkdf2 = { workspace = true }
+hmac = { workspace = true }
+cipher = { workspace = true }
+digest = { workspace = true }
+zeroize = { workspace = true }

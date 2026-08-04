@@ -1,0 +1,24 @@
+[package]
+name = "vaultpony-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "GPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "vaultpony"
+path = "src/main.rs"
+
+[dependencies]
+vault-core = { workspace = true }
+vc-types = { workspace = true }
+vc-fs = { workspace = true }
+vc-format = { workspace = true }
+vc-io = { workspace = true }
+vc-crypto = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+log = { workspace = true }
+rpassword = "7"
+zeroize = { workspace = true }
