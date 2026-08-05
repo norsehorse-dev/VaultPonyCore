@@ -31,6 +31,7 @@ pub mod dir;
 pub mod fat;
 pub mod format;
 pub mod upcase;
+mod upcase_data;
 pub mod write;
 
 use std::io;
