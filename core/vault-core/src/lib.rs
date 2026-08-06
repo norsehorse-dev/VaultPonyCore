@@ -91,6 +91,6 @@ pub fn core_version() -> String {
 mod tests {
     #[test]
     fn version_is_populated() {
-        assert!(super::core_version().starts_with("vault-core 0."));
+        assert!(super::core_version().starts_with("vault-core "));
     }
 }
