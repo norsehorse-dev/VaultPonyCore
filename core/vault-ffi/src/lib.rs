@@ -300,6 +300,10 @@ pub enum VaultError {
     Io { detail: String },
     #[error("internal error")]
     Internal,
+    /// Argon2id needed more memory than the device could spare. Not a wrong
+    /// password: the shell should say so and can offer a PBKDF2-only retry.
+    #[error("not enough free memory for Argon2id ({needed_mib} MiB needed)")]
+    KdfOutOfMemory { needed_mib: u32 },
 }
 
 impl From<VcError> for VaultError {
@@ -321,6 +325,7 @@ impl From<VcError> for VaultError {
                 detail: io.kind().to_string(),
             },
             VcError::Internal(_) => VaultError::Internal,
+            VcError::KdfOutOfMemory { needed_mib } => VaultError::KdfOutOfMemory { needed_mib },
         }
     }
 }

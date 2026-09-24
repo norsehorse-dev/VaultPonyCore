@@ -36,6 +36,15 @@ the same reviewed change, never blindly.
 - Kuznyechik-family schemes are `format_enabled=0` in 1.26.x: the pinned
   CLI mounts them but refuses to create them. Their 30 fixtures need a
   one-time build with an older VeraCrypt (1.25.9) — tracked as `missing`
-  in the manifest until then.
+  in the manifest until then. The 6 Kuznyechik-family Argon2id fixtures
+  have no such fallback: Argon2id arrived in 1.26.29, after upstream stopped
+  creating Kuznyechik volumes, so no stock VeraCrypt can build them.
+- Argon2id refuses PIMs below its default (12) unless the password has 20+
+  characters, so Argon2id fixtures use the longer
+  `vaultpony-fixture-argon2` password.
+- The CLI's kernel mount needs device-mapper and vfat. On hosts without
+  them, `--no-populate` still builds every container for the unlock gates;
+  `veracrypt --text -m nokernelcrypto --filesystem=none --mount` exposes
+  the decrypted image for `fsck.fat` / `mtools` checks.
 - Large (>4 GiB) files inside fixtures are deferred to P5 so the corpus
   stays small enough to cache in CI.

@@ -15,7 +15,7 @@ or linked.
 |---|---|
 | core/vc-types | Header layout, cipher/PRF registry (generated), geometry, errors |
 | core/vc-format | Header discovery, candidate search, decrypt/validate, backup headers |
-| core/vc-crypto | PBKDF2 header-key derivation, XTS engine including cascades |
+| core/vc-crypto | Header-key derivation (PBKDF2, Argon2id), XTS engine including cascades |
 | core/vc-io | Block-device trait: std::fs file (desktop) and raw-fd (mobile) |
 | core/vc-fs | VFS trait and adapters: fatfs (RW), norse-exfat, ntfs (RO) |
 | core/norse-exfat | Our exFAT implementation |

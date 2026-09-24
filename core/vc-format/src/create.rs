@@ -92,12 +92,11 @@ fn write_header_copy(
     fill_random(&mut salt)?;
 
     let secret = vc_crypto::apply_keyfiles(params.passphrase, params.keyfiles);
-    let iterations = vc_types::registry::iterations_for_pim(params.prf, params.pim);
-    let key = vc_crypto::derive_header_key(
-        params.prf.name,
+    let key = vc_crypto::derive_header_key_for(
+        params.prf,
         &secret,
         &salt,
-        iterations,
+        params.pim,
         params.scheme.key_bytes(),
     )?;
     let xts = vc_crypto::SchemeXts::new(params.scheme, key.as_bytes())?;

@@ -133,6 +133,13 @@ The UX rules hidden volumes impose hold from 1.0 (doc §11):
   must be shown based on *user intent* (they asked), never spontaneously.
   UI copy for anything hidden-volume-adjacent gets reviewed against this
   paragraph.
+- Argon2id volumes (VeraCrypt 1.26.29+) keep that property: the unlock
+  search still derives every (KDF, slot) pair on a wrong password, sweeping
+  the Argon2id slots one at a time through one buffer. That buffer holds
+  password-dependent state and is wiped after every derivation and on
+  drop. Running out of memory is reported as its own error, never as a
+  wrong password, and is raised before any Argon2id slot is tried, so it
+  says nothing about which slots exist.
 - Remembered unlock parameters (PRF/scheme cache keyed by salt fingerprint)
   contain no secrets and no evidence of hidden-slot probing. Remembering a
   PIM is opt-in per container because a stored PIM is weak evidence a

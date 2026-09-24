@@ -9,6 +9,6 @@ pub mod kdf;
 pub mod keyfile;
 pub mod xts;
 
-pub use kdf::{derive_header_key, HeaderKey};
+pub use kdf::{derive_argon2id, derive_header_key, derive_header_key_for, Argon2Memory, HeaderKey};
 pub use keyfile::apply_keyfiles;
 pub use xts::SchemeXts;

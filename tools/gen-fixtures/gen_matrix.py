@@ -5,7 +5,9 @@ VeraCrypt source checkout (planning doc §4: do not hand-maintain the matrix).
 Reads:
   src/Common/Crypto.c   -> EncryptionAlgorithms[] (schemes, layer order,
                            FormatEnabled) and Hashes[] (PRF names, order)
-  src/Common/Pkcs5.c    -> get_pkcs5_iteration_count() non-boot defaults
+  src/Common/Pkcs5.c    -> get_pkcs5_iteration_count() non-boot defaults,
+                           get_argon2_params() PIM -> Argon2id cost schedule
+  src/Common/Crypto.h   -> ARGON2_HEADER_KEYDATA_SIZE
 
 Emits:
   core/vc-types/src/registry/generated.rs   (Rust registry table)
@@ -51,11 +53,24 @@ CIPHER_TOKENS = {
 # upstream changed the format surface — that is a finding, not a nuisance,
 # so the script fails loudly rather than emitting a surprise.
 EXPECTED_SCHEME_COUNT = 15
-EXPECTED_PRF_COUNT = 5
+EXPECTED_PRF_COUNT = 6
 
 # Try-order for the unlock search (doc §6): SHA-512 first. This is ours, not
 # upstream's; it is applied to the parsed PRF list by name.
-PRF_POPULARITY = ["SHA-512", "SHA-256", "BLAKE2s-256", "Whirlpool", "Streebog"]
+# Argon2id goes last: it is the only memory-hard KDF and each derivation
+# costs hundreds of MiB, so the cheap PBKDF2 candidates are exhausted first.
+PRF_POPULARITY = ["SHA-512", "SHA-256", "BLAKE2s-256", "Whirlpool", "Streebog",
+                  "Argon2id"]
+
+# Upstream lists Argon2 in Hashes[] under its internal hash ("BLAKE2b-512")
+# because that table doubles as the hash list. Our registry names KDFs, and
+# the CLI accepts "Argon2id" for it, so the token is renamed here.
+KDF_TOKEN_NAMES = {"ARGON2": "Argon2id"}
+
+# The only Argon2 parameters this format has ever used. A change here means
+# a new on-disk format, not a tweak, so the parser insists on them.
+ARGON2_VERSION = 0x13
+ARGON2_PARALLELISM = 1
 
 
 def die(msg: str) -> "NoReturn":
@@ -155,6 +170,12 @@ def parse_prfs(crypto_c: str, pkcs5_c: str):
         block = cases.get(token)
         if block is None:
             die(f"no iteration-count case for PRF token {token}")
+        if token in KDF_TOKEN_NAMES:
+            if "get_argon2_params" not in block:
+                die(f"{token} case no longer calls get_argon2_params")
+            prfs.append({"name": KDF_TOKEN_NAMES[token], "token": token,
+                         "kdf": "argon2id", "default_iterations": 0})
+            continue
         # Style A: iteration_count = (pim == 0) ? N : ...
         m_a = re.search(r"\(pim\s*==\s*0\)\s*\?\s*(\d+)", block)
         # Style B: if (pim == 0) iteration_count = bBoot ? BOOT : NONBOOT;
@@ -165,7 +186,8 @@ def parse_prfs(crypto_c: str, pkcs5_c: str):
             default_iters = int(m_b.group(1))
         else:
             die(f"could not extract non-boot pim==0 iterations for {token}")
-        prfs.append({"name": name, "token": token, "default_iterations": default_iters})
+        prfs.append({"name": name, "token": token, "kdf": "pbkdf2",
+                     "default_iterations": default_iters})
 
     order = {n: i for i, n in enumerate(PRF_POPULARITY)}
     unknown = [p["name"] for p in prfs if p["name"] not in order]
@@ -177,7 +199,60 @@ def parse_prfs(crypto_c: str, pkcs5_c: str):
     return prfs
 
 
-def render_rust(schemes, prfs, tag) -> str:
+def parse_argon2(pkcs5_c: str, crypto_h: str):
+    """Extract the PIM -> (memory, passes) schedule from get_argon2_params()
+    and the fixed header-KDF output size. Every constant is matched against
+    the exact expression upstream uses, so any change to the schedule stops
+    the generator instead of silently shipping a different format."""
+    fn = re.search(r"void\s+get_argon2_params\s*\([^)]*\)\s*\{(.*?)\n\}",
+                   pkcs5_c, re.S)
+    if not fn:
+        die("get_argon2_params not found in Pkcs5.c")
+    body = fn.group(1)
+
+    def one(pattern, what):
+        m = re.search(pattern, body, re.S)
+        if not m:
+            die(f"get_argon2_params: could not find {what}; upstream changed")
+        return [int(g) for g in m.groups()]
+
+    (default_pim,) = one(r"if\s*\(\s*pim\s*==\s*0\s*\)\s*\{\s*pim\s*=\s*(\d+)\s*;",
+                         "the pim==0 default")
+    m_base, m_step = one(r"m_cost_mib\s*=\s*(\d+)\s*\+\s*\(\s*pim\s*-\s*1\s*\)\s*\*\s*(\d+)\s*;",
+                         "the memory formula")
+    m_cap, m_cap2 = one(r"if\s*\(\s*m_cost_mib\s*>\s*(\d+)\s*\)\s*\{\s*m_cost_mib\s*=\s*(\d+)\s*;",
+                        "the memory cap")
+    if m_cap != m_cap2:
+        die("get_argon2_params: memory cap compares and assigns different values")
+    (t_split,) = one(r"if\s*\(\s*pim\s*<=\s*(\d+)\s*\)", "the time-cost split")
+    t_base, t_div = one(r"\*pIterations\s*=\s*(\d+)\s*\+\s*\(\s*\(\s*pim\s*-\s*1\s*\)\s*/\s*(\d+)\s*\)\s*;",
+                        "the low-PIM time formula")
+    t_high_base, t_high_sub = one(r"else\s*\{\s*\*pIterations\s*=\s*(\d+)\s*\+\s*\(\s*pim\s*-\s*(\d+)\s*\)\s*;",
+                                  "the high-PIM time formula")
+    if t_high_sub != t_split:
+        die("get_argon2_params: high-PIM formula no longer offsets by the split PIM")
+    if "* 1024" not in body:
+        die("get_argon2_params: MiB -> KiB conversion changed")
+
+    k = re.search(r"#define\s+ARGON2_HEADER_KEYDATA_SIZE\s+(\d+)", crypto_h)
+    if not k:
+        die("ARGON2_HEADER_KEYDATA_SIZE not found in Crypto.h")
+    return {
+        "default_pim": default_pim,
+        "memory_base_mib": m_base,
+        "memory_step_mib": m_step,
+        "memory_cap_mib": m_cap,
+        "passes_base": t_base,
+        "passes_divisor": t_div,
+        "passes_split_pim": t_split,
+        "passes_high_base": t_high_base,
+        "output_len": int(k.group(1)),
+        "version": ARGON2_VERSION,
+        "parallelism": ARGON2_PARALLELISM,
+    }
+
+
+def render_rust(schemes, prfs, argon2, tag) -> str:
     lines = [
         "// @generated by tools/gen-fixtures/gen_matrix.py — DO NOT EDIT BY HAND.",
         f"// Source of truth: pinned VeraCrypt checkout {tag} (tools/gen-fixtures/PIN).",
@@ -187,7 +262,7 @@ def render_rust(schemes, prfs, tag) -> str:
         "// is applied to the plaintext first, then AES. Verify against fixtures",
         "// before the first data-path test (vc-types/src/registry.rs note).",
         "",
-        "use super::{Cipher, EncryptionScheme, Prf};",
+        "use super::{Argon2Schedule, Cipher, EncryptionScheme, Kdf, Prf};",
         "",
         "pub static ENCRYPTION_SCHEMES: &[EncryptionScheme] = &[",
     ]
@@ -199,21 +274,39 @@ def render_rust(schemes, prfs, tag) -> str:
     lines += ["];", "", "pub static PRFS: &[Prf] = &["]
     for p in prfs:
         iters = f"{p['default_iterations']:_}"
+        kdf = {"pbkdf2": "Kdf::Pbkdf2", "argon2id": "Kdf::Argon2id"}[p["kdf"]]
         lines.append(
-            f'    Prf {{ name: "{p["name"]}", default_iterations: {iters}, '
+            f'    Prf {{ name: "{p["name"]}", kdf: {kdf}, default_iterations: {iters}, '
             f'popularity_rank: {p["popularity_rank"]} }},'
         )
     lines += ["];", ""]
+    a = argon2
+    lines += [
+        "/// PIM -> Argon2id cost schedule, from get_argon2_params() in Pkcs5.c.",
+        "pub const ARGON2_SCHEDULE: Argon2Schedule = Argon2Schedule {",
+        f"    default_pim: {a['default_pim']},",
+        f"    memory_base_mib: {a['memory_base_mib']},",
+        f"    memory_step_mib: {a['memory_step_mib']},",
+        f"    memory_cap_mib: {a['memory_cap_mib']},",
+        f"    passes_base: {a['passes_base']},",
+        f"    passes_divisor: {a['passes_divisor']},",
+        f"    passes_split_pim: {a['passes_split_pim']},",
+        f"    passes_high_base: {a['passes_high_base']},",
+        f"    output_len: {a['output_len']},",
+        "};",
+        "",
+    ]
     return "\n".join(lines)
 
 
-def build_fixture_list(schemes, prfs):
+def build_fixture_list(schemes, prfs, argon2):
     """Enumerate the fixture corpus (doc §13): full scheme x PRF coverage on
     the default geometry, plus focused axis sweeps on the default scheme.
     Target is ~100-150 containers; every entry is one container."""
     fixtures = []
 
     def add(scheme, prf, fs="FAT", sector=512, pim=0, hidden=False):
+        argon = prf["kdf"] == "argon2id"
         fid = "-".join([
             re.sub(r"[^A-Za-z0-9]+", "_", scheme["name"]).strip("_").lower(),
             re.sub(r"[^A-Za-z0-9]+", "_", prf["name"]).strip("_").lower(),
@@ -232,16 +325,24 @@ def build_fixture_list(schemes, prfs):
             # (Kuznyechik family in 1.26.x); those need a legacy VC build.
             "creatable_with_pinned_vc": scheme["format_enabled"],
             "size_mib": 16 if fs != "NTFS" else 20,
-            "password": "vaultpony-fixture",
+            # Upstream refuses Argon2 PIMs below the default unless the
+            # password has 20+ characters; one longer password covers all.
+            "password": "vaultpony-fixture-argon2" if argon else "vaultpony-fixture",
         })
 
     default_scheme = schemes[0]           # AES
     default_prf = prfs[0]                 # SHA-512
+    pbkdf2_prfs = [p for p in prfs if p["kdf"] == "pbkdf2"]
+    argon2_prfs = [p for p in prfs if p["kdf"] == "argon2id"]
 
-    # 1. Full scheme x PRF sweep on default geometry: 15 x 5 = 75.
+    # 1. Full scheme x PRF sweep on default geometry: 15 x 5 = 75 PBKDF2,
+    #    plus 15 Argon2id at PIM 1 (64 MiB, 3 passes) so the sweep stays
+    #    cheap while still slicing every scheme's key from the 192-byte output.
     for s in schemes:
-        for p in prfs:
+        for p in pbkdf2_prfs:
             add(s, p)
+        for p in argon2_prfs:
+            add(s, p, pim=1)
 
     # 2. Filesystem sweep on AES/SHA-512: covers exFAT + NTFS (created RW
     #    by desktop VC; we only ever read them). No 4096-sector fixtures:
@@ -254,9 +355,14 @@ def build_fixture_list(schemes, prfs):
 
     # 3. PIM coverage: nonzero PIM on each PRF (pim=485 -> 500k, a nice
     #    round-trip check on the schedule), plus a high-PIM outlier.
-    for p in prfs:
+    for p in pbkdf2_prfs:
         add(default_scheme, p, pim=485)
     add(default_scheme, default_prf, pim=2000)
+    #    Argon2id: the default (PIM 0 = PIM 12) and the first PIM on the
+    #    high-PIM time formula, where memory is already at the cap.
+    for p in argon2_prfs:
+        add(default_scheme, p, pim=0)
+        add(default_scheme, p, pim=argon2["passes_split_pim"] + 1)
 
     # 4. Hidden volumes (P8 targets; probed-but-refused before that): default
     #    combo plus one cascade, one alternate PRF, one on exFAT.
@@ -264,6 +370,8 @@ def build_fixture_list(schemes, prfs):
     add(schemes[6] if len(schemes) > 6 else default_scheme, default_prf, hidden=True)
     add(default_scheme, prfs[1], hidden=True)
     add(default_scheme, default_prf, fs="exFAT", hidden=True)
+    for p in argon2_prfs:
+        add(default_scheme, p, pim=1, hidden=True)
 
     ids = [f["id"] for f in fixtures]
     dupes = {i for i in ids if ids.count(i) > 1}
@@ -272,8 +380,19 @@ def build_fixture_list(schemes, prfs):
     return fixtures
 
 
-def render_matrix(schemes, prfs, tag, commit) -> str:
-    fixtures = build_fixture_list(schemes, prfs)
+def rustfmt(src: str) -> str:
+    """The committed registry is rustfmt-formatted; format the generated text
+    the same way so --check compares like with like."""
+    try:
+        out = subprocess.run(["rustfmt", "--edition", "2021", "--emit", "stdout"],
+                             input=src, text=True, capture_output=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        die(f"rustfmt failed on the generated registry: {e}")
+    return out.stdout
+
+
+def render_matrix(schemes, prfs, argon2, tag, commit) -> str:
+    fixtures = build_fixture_list(schemes, prfs, argon2)
     doc = {
         "_comment": "Generated by tools/gen-fixtures/gen_matrix.py — do not hand-edit.",
         "veracrypt_pin": {"tag": tag, "commit": commit},
@@ -282,10 +401,11 @@ def render_matrix(schemes, prfs, tag, commit) -> str:
             for s in schemes
         ],
         "prfs": [
-            {k: p[k] for k in ["name", "token", "default_iterations", "popularity_rank"]}
+            {k: p[k] for k in ["name", "token", "kdf", "default_iterations", "popularity_rank"]}
             for p in prfs
         ],
         "pim_schedule": {"base": 15000, "per_unit": 1000},
+        "argon2_schedule": argon2,
         "fixture_count": len(fixtures),
         "fixtures": fixtures,
     }
@@ -312,8 +432,12 @@ def main():
     pkcs5_c = strip_block_comments(
         (args.vc_src / "src/Common/Pkcs5.c").read_text(errors="replace"))
 
+    crypto_h = strip_block_comments(
+        (args.vc_src / "src/Common/Crypto.h").read_text(errors="replace"))
+
     schemes = parse_schemes(crypto_c)
     prfs = parse_prfs(crypto_c, pkcs5_c)
+    argon2 = parse_argon2(pkcs5_c, crypto_h)
 
     if len(schemes) != EXPECTED_SCHEME_COUNT:
         die(f"parsed {len(schemes)} schemes, expected {EXPECTED_SCHEME_COUNT} — "
@@ -324,8 +448,8 @@ def main():
             f"upstream changed; update EXPECTED_* and review:\n"
             + "\n".join(p["name"] for p in prfs))
 
-    rust = render_rust(schemes, prfs, tag)
-    matrix = render_matrix(schemes, prfs, tag, commit)
+    rust = rustfmt(render_rust(schemes, prfs, argon2, tag))
+    matrix = render_matrix(schemes, prfs, argon2, tag, commit)
 
     if args.check:
         ok = True

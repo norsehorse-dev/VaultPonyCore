@@ -122,9 +122,8 @@ pub fn change_password(
     dev.read_at(matched_off, &mut salt)?;
     let mut plaintext = [0u8; consts::HEADER_ENC_LEN];
     dev.read_at(matched_off + consts::SALT_LEN as u64, &mut plaintext)?;
-    let old_iters = vc_types::registry::iterations_for_pim(prf, old.pim);
     let old_key =
-        vc_crypto::derive_header_key(prf.name, old.passphrase, &salt, old_iters, scheme.key_bytes())?;
+        vc_crypto::derive_header_key_for(prf, old.passphrase, &salt, old.pim, scheme.key_bytes())?;
     let xts_old = vc_crypto::SchemeXts::new(scheme, old_key.as_bytes())?;
     xts_old.decrypt_header(&mut plaintext);
     // Confirm the recovered plaintext really is this volume's header.
@@ -142,15 +141,14 @@ pub fn change_password(
             len - consts::BACKUP_STANDARD_FROM_END,
         )
     };
-    let new_iters = vc_types::registry::iterations_for_pim(prf, new.pim);
     for off in [primary_off, backup_off] {
         let mut new_salt = [0u8; consts::SALT_LEN];
         getrandom::getrandom(&mut new_salt).map_err(|e| VcError::Internal(format!("rng: {e}")))?;
-        let new_key = vc_crypto::derive_header_key(
-            prf.name,
+        let new_key = vc_crypto::derive_header_key_for(
+            prf,
             new.passphrase,
             &new_salt,
-            new_iters,
+            new.pim,
             scheme.key_bytes(),
         )?;
         let xts_new = vc_crypto::SchemeXts::new(scheme, new_key.as_bytes())?;

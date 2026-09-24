@@ -193,11 +193,42 @@ pub fn find_header_at(
         }
     }
 
-    // Remaining PRFs, each swept across every slot in parallel. A wrong
-    // password reaches the end of this, deriving every (PRF, slot) pair before
-    // failing — so unlock time is independent of whether a hidden volume
-    // exists, and probing the hidden slot leaves no trace (doc §11).
+    // Remaining PRFs, each swept across every slot. A wrong password reaches
+    // the end of this, deriving every (PRF, slot) pair before failing — so
+    // unlock time is independent of whether a hidden volume exists, and
+    // probing the hidden slot leaves no trace (doc §11).
+    //
+    // PBKDF2 PRFs sweep the slots in parallel. Argon2id sweeps them one at a
+    // time through a single reused buffer: at the default PIM each derivation
+    // holds 416 MiB, so four slots at once would need ~1.6 GiB (4 GiB at the
+    // 1 GiB cap), more than many phones can give an app.
     for prf in prfs.iter().skip(1) {
+        if prf.kdf == vc_types::Kdf::Argon2id {
+            let mut memory = vc_crypto::Argon2Memory::for_pim(secret.pim)?;
+            for slot in &slots {
+                progress(step, total, prf.name);
+                step += 1;
+                let key = vc_crypto::derive_argon2id(
+                    &mut memory,
+                    secret.passphrase,
+                    &slot.salt,
+                    secret.pim,
+                    max_key_len,
+                )?;
+                match try_schemes(&supported, &key, &slot.enc, slot.position) {
+                    SchemeOutcome::Found(header, scheme) => {
+                        return Ok(FoundHeader {
+                            header: *header,
+                            scheme,
+                            prf,
+                        })
+                    }
+                    SchemeOutcome::Finding(e) => best_finding = Some(e),
+                    SchemeOutcome::Miss => {}
+                }
+            }
+            continue;
+        }
         let keys: Vec<VcResult<vc_crypto::HeaderKey>> = std::thread::scope(|s| {
             let handles: Vec<_> = slots
                 .iter()
@@ -231,8 +262,7 @@ fn derive_for(
     salt: &[u8; consts::SALT_LEN],
     key_len: usize,
 ) -> VcResult<vc_crypto::HeaderKey> {
-    let iterations = vc_types::registry::iterations_for_pim(prf, secret.pim);
-    vc_crypto::derive_header_key(prf.name, secret.passphrase, salt, iterations, key_len)
+    vc_crypto::derive_header_key_for(prf, secret.passphrase, salt, secret.pim, key_len)
 }
 
 enum SchemeOutcome {

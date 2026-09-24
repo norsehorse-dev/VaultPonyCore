@@ -1,14 +1,17 @@
-//! Header-key derivation: PBKDF2-HMAC over the candidate PRF (doc §6).
+//! Header-key derivation (doc §6): PBKDF2-HMAC over the candidate PRF, or
+//! Argon2id for volumes made with VeraCrypt 1.26.29+.
 
+use argon2::{Algorithm, Argon2, Block, Params, Version};
 use pbkdf2::pbkdf2_hmac;
-use vc_types::{VcError, VcResult};
+use vc_types::registry::{argon2_cost, iterations_for_pim, Argon2Cost, ARGON2_SCHEDULE};
+use vc_types::{Kdf, Prf, VcError, VcResult};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Derived header-key material: sized for the largest cascade
-/// (3 layers x 64 bytes = 192). Only the first `len` bytes are meaningful —
-/// deriving exactly what the scheme needs matters, because every extra
-/// PBKDF2 output block costs the full iteration count again. Zeroized on
-/// drop.
+/// (3 layers x 64 bytes = 192), which is also Argon2id's fixed output. Only
+/// the first `len` bytes are meaningful. For PBKDF2, deriving exactly what the
+/// scheme needs matters, because every extra output block costs the full
+/// iteration count again. Zeroized on drop.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HeaderKey {
     bytes: [u8; 192],
@@ -63,6 +66,144 @@ pub fn derive_header_key(
     Ok(key)
 }
 
+/// Derive the header key for one KDF candidate at a PIM. PBKDF2 derives
+/// exactly `key_len` bytes; Argon2id always derives its fixed 192 bytes and
+/// keeps the first `key_len`, because asking Argon2 for fewer bytes changes
+/// the output rather than truncating it.
+///
+/// Argon2id allocates its working memory for this one call. Callers
+/// deriving several Argon2id keys in a row should hold one [`Argon2Memory`]
+/// and use [`derive_argon2id`] instead.
+pub fn derive_header_key_for(
+    prf: &Prf,
+    passphrase: &[u8],
+    salt: &[u8; vc_types::consts::SALT_LEN],
+    pim: u32,
+    key_len: usize,
+) -> VcResult<HeaderKey> {
+    match prf.kdf {
+        Kdf::Pbkdf2 => derive_header_key(
+            prf.name,
+            passphrase,
+            salt,
+            iterations_for_pim(prf, pim),
+            key_len,
+        ),
+        Kdf::Argon2id => {
+            let mut memory = Argon2Memory::for_pim(pim)?;
+            derive_argon2id(&mut memory, passphrase, salt, pim, key_len)
+        }
+    }
+}
+
+/// Working memory for Argon2id derivations: `memory_kib` 1 KiB blocks.
+///
+/// Allocated fallibly, so a phone that cannot spare the memory gets
+/// [`VcError::KdfOutOfMemory`] instead of an allocator abort that takes the
+/// whole app down. The blocks are the password-dependent Argon2 state, so
+/// they are wiped on drop.
+pub struct Argon2Memory {
+    blocks: Vec<Block>,
+}
+
+impl Argon2Memory {
+    /// Memory for every derivation at `pim` (PIM 0 is upstream's default).
+    pub fn for_pim(pim: u32) -> VcResult<Self> {
+        Self::for_cost(argon2_cost(pim))
+    }
+
+    fn for_cost(cost: Argon2Cost) -> VcResult<Self> {
+        let count = params(cost, ARGON2_SCHEDULE.output_len)?.block_count();
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(count)
+            .map_err(|_| VcError::KdfOutOfMemory {
+                needed_mib: cost.memory_mib(),
+            })?;
+        blocks.resize(count, Block::new());
+        Ok(Self { blocks })
+    }
+
+    /// MiB held, for progress and diagnostics.
+    pub fn mib(&self) -> usize {
+        self.blocks.len() / 1024
+    }
+}
+
+impl Drop for Argon2Memory {
+    fn drop(&mut self) {
+        wipe(&mut self.blocks);
+    }
+}
+
+/// Argon2id header-key derivation into caller-held memory, which must have
+/// been sized for the same PIM (it can be reused across salts).
+pub fn derive_argon2id(
+    memory: &mut Argon2Memory,
+    passphrase: &[u8],
+    salt: &[u8; vc_types::consts::SALT_LEN],
+    pim: u32,
+    key_len: usize,
+) -> VcResult<HeaderKey> {
+    let full = ARGON2_SCHEDULE.output_len;
+    debug_assert!(key_len <= full && full <= 192);
+    let mut key = HeaderKey {
+        bytes: [0u8; 192],
+        len: key_len,
+    };
+    argon2id_raw(
+        memory,
+        argon2_cost(pim),
+        passphrase,
+        salt,
+        &mut key.bytes[..full],
+    )?;
+    Ok(key)
+}
+
+fn wipe(blocks: &mut [Block]) {
+    for b in blocks {
+        b.zeroize();
+    }
+}
+
+fn params(cost: Argon2Cost, out_len: usize) -> VcResult<Params> {
+    Params::new(cost.memory_kib, cost.passes, 1, Some(out_len))
+        .map_err(|e| VcError::Internal(format!("argon2 params: {e}")))
+}
+
+/// Plain Argon2id v0x13, parallelism 1: what upstream's
+/// `derive_key_argon2` computes. `out.len()` is part of the hash input.
+fn argon2id_raw(
+    memory: &mut Argon2Memory,
+    cost: Argon2Cost,
+    passphrase: &[u8],
+    salt: &[u8],
+    out: &mut [u8],
+) -> VcResult<()> {
+    let ctx = Argon2::new(
+        Algorithm::Argon2id,
+        Version::V0x13,
+        params(cost, out.len())?,
+    );
+    let need = ctx.params().block_count();
+    if memory.blocks.len() < need {
+        return Err(VcError::Internal(format!(
+            "argon2 memory holds {} blocks, derivation needs {need}",
+            memory.blocks.len()
+        )));
+    }
+    let result =
+        ctx.hash_password_into_with_memory(passphrase, salt, out, &mut memory.blocks[..need]);
+    // The blocks are reused for the next salt; wipe between derivations too,
+    // not only on drop.
+    wipe(&mut memory.blocks[..need]);
+    result.map_err(|e| {
+        out.zeroize();
+        VcError::Internal(format!("argon2: {e}"))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,6 +220,89 @@ mod tests {
         // its prefix with a shorter one.
         assert_eq!(&c.as_bytes()[..64], a.as_bytes());
         assert_ne!(a.as_bytes(), &[0u8; 64][..]);
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn argon2id_matches_reference_vector() {
+        // Argon2 reference implementation test vector (phc-winner-argon2
+        // test.c): Argon2id v0x13, t=2, m=2^16 KiB, p=1, "password",
+        // "somesalt", 32-byte tag.
+        let cost = Argon2Cost {
+            memory_kib: 65_536,
+            passes: 2,
+        };
+        let mut mem = Argon2Memory::for_cost(cost).unwrap();
+        let mut out = [0u8; 32];
+        argon2id_raw(&mut mem, cost, b"password", b"somesalt", &mut out).unwrap();
+        assert_eq!(
+            hex(&out),
+            "09316115d5cf24ed5a15a31a3ba326e5cf32edc24702987c02b6566f61913cf7"
+        );
+        // Wiped after use.
+        assert!(mem
+            .blocks
+            .iter()
+            .all(|b| b.as_ref().iter().all(|w| *w == 0)));
+    }
+
+    #[test]
+    fn argon2id_header_key_is_a_prefix_of_the_192_byte_output() {
+        // PIM 1 = 64 MiB, 3 passes. Expected value computed with libargon2
+        // (argon2-cffi hash_secret_raw, Type.ID, version 19, 192 bytes).
+        let salt: [u8; 64] = core::array::from_fn(|i| i as u8);
+        let argon = vc_types::registry::PRFS
+            .iter()
+            .find(|p| p.kdf == Kdf::Argon2id)
+            .unwrap();
+        let aes = derive_header_key_for(argon, b"vaultpony", &salt, 1, 64).unwrap();
+        let cascade = derive_header_key_for(argon, b"vaultpony", &salt, 1, 192).unwrap();
+        assert_eq!(
+            hex(cascade.as_bytes()),
+            "c2a418968280b57acc33f3e7c59484c6c64497ba9c0cc177ee6b06612f794597\
+             776843698a7173554a4d4656c551b8817a4258ed02840ba7e241c0c0c619fed9\
+             24fbee1361b93cadd7b960216ae64ff2c795077006fe88dabbb056aacc704ea2\
+             1eb893f0ee31ca2ce3802690d53878d7e4455d166d01fdea09482cb64adf1e47\
+             69313197b410f62732b45a31303e2eb18b09e1fb66d80571c5a8866f55c44200\
+             faf24db83034dadfc2c0bad6aaeeafbde0050928466117f4fd704e6c151a4718"
+        );
+        assert_eq!(aes.as_bytes(), &cascade.as_bytes()[..64]);
+
+        // The trap upstream documents: a 64-byte request is a different hash.
+        let cost = argon2_cost(1);
+        let mut mem = Argon2Memory::for_cost(cost).unwrap();
+        let mut short = [0u8; 64];
+        argon2id_raw(&mut mem, cost, b"vaultpony", &salt, &mut short).unwrap();
+        assert_ne!(&short[..], aes.as_bytes());
+    }
+
+    #[test]
+    fn argon2_memory_is_reusable_across_salts() {
+        let mut mem = Argon2Memory::for_pim(1).unwrap();
+        assert_eq!(mem.mib(), 64);
+        let a = derive_argon2id(&mut mem, b"pw", &[1u8; 64], 1, 64).unwrap();
+        let b = derive_argon2id(&mut mem, b"pw", &[2u8; 64], 1, 64).unwrap();
+        let a2 = derive_argon2id(&mut mem, b"pw", &[1u8; 64], 1, 64).unwrap();
+        assert_ne!(a.as_bytes(), b.as_bytes());
+        assert_eq!(a.as_bytes(), a2.as_bytes());
+    }
+
+    #[test]
+    fn argon2_memory_too_small_is_refused() {
+        let mut mem = Argon2Memory::for_pim(1).unwrap();
+        assert!(derive_argon2id(&mut mem, b"pw", &[0u8; 64], 2, 64).is_err());
+    }
+
+    #[test]
+    fn pbkdf2_dispatch_matches_direct_call() {
+        let sha512 = &vc_types::registry::PRFS[0];
+        let salt = [9u8; 64];
+        let via = derive_header_key_for(sha512, b"pw", &salt, 1, 64).unwrap();
+        let direct = derive_header_key("SHA-512", b"pw", &salt, 16_000, 64).unwrap();
+        assert_eq!(via.as_bytes(), direct.as_bytes());
     }
 
     #[test]

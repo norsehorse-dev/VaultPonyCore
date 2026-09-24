@@ -43,6 +43,9 @@ sha2 = "0.10"
 blake2 = "0.10"
 streebog = "0.10"
 pbkdf2 = "0.12"
+# Argon2id header KDF (VeraCrypt 1.26.29+). No default features: we hand it
+# our own block buffer, so it never allocates, and `zeroize` wipes that buffer.
+argon2 = { version = "0.5", default-features = false, features = ["zeroize"] }
 hmac = "0.12"
 cipher = "0.4"
 digest = "0.10"

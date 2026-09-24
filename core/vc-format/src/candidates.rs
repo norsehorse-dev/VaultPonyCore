@@ -48,6 +48,7 @@ mod tests {
         let c = ordered_candidates(&[HeaderPosition::Primary]);
         assert_eq!(c[0].prf.name, "SHA-512");
         assert_eq!(c[0].scheme.name, "AES");
-        assert_eq!(c.len(), 15 * 5);
+        assert_eq!(c.len(), 15 * 6);
+        assert_eq!(c.last().unwrap().prf.name, "Argon2id");
     }
 }

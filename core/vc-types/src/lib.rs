@@ -11,7 +11,7 @@ pub mod registry;
 
 pub use error::{VcError, VcResult};
 pub use header::{HeaderPosition, VolumeGeometry, VolumeHeader};
-pub use registry::{Cipher, EncryptionScheme, Prf};
+pub use registry::{Argon2Cost, Cipher, EncryptionScheme, Kdf, Prf};
 
 /// Container-level constants (planning doc §6).
 pub mod consts {

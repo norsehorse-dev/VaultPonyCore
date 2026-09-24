@@ -43,6 +43,12 @@ pub enum VcError {
     #[error("filesystem error: {0}")]
     Filesystem(String),
 
+    /// The device could not spare the memory an Argon2id derivation needs.
+    /// Distinct from a wrong password so the UI can say what happened and
+    /// offer a PBKDF2-only unlock instead.
+    #[error("not enough free memory for Argon2id ({needed_mib} MiB needed)")]
+    KdfOutOfMemory { needed_mib: u32 },
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
