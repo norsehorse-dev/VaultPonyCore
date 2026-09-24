@@ -18,7 +18,7 @@ use crate::{ExfatError, ExfatResult, WriteAt};
 /// Microsoft's canonical compressed up-case table (extracted from a
 /// reference `mkfs.exfat` volume). Its checksum is recomputed at format time
 /// so the directory entry always matches these bytes.
-const UPCASE: &[u8] = include_bytes!("upcase_table.bin");
+const UPCASE: &[u8] = &crate::upcase_data::UPCASE_TABLE;
 
 const BPS_SHIFT: u32 = 9;
 const BPS: u64 = 1 << BPS_SHIFT; // 512
