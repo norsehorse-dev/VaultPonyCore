@@ -39,15 +39,7 @@ fn sha(data: &[u8]) -> String {
 /// format layer directly (no VeraCrypt dependency in the test).
 fn decrypt_to_image(container: &Path, out: &Path) {
     let mut dev = FileDevice::open_read(container).unwrap();
-    let found = find_header(
-        &mut dev,
-        &UnlockSecret {
-            passphrase: PASSWORD,
-            pim: 0,
-        },
-        &mut |_, _, _| {},
-    )
-    .unwrap();
+    let found = find_header(&mut dev, &UnlockSecret::new(PASSWORD, 0), &mut |_, _, _| {}).unwrap();
     let geometry = found.header.geometry;
     let xts = vc_crypto::SchemeXts::new(
         found.scheme,

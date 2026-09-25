@@ -16,7 +16,8 @@ pub use create::{create_hidden, create_volume, CreateParams};
 pub use decrypted::DecryptedDevice;
 pub use protect::ProtectedDevice;
 
-use vc_types::{consts, HeaderPosition, VcError, VcResult, VolumeHeader};
+use std::sync::atomic::{AtomicBool, Ordering};
+use vc_types::{consts, HeaderPosition, KdfFilter, VcError, VcResult, VolumeHeader};
 
 /// Everything the user supplies to an unlock attempt. Wiped on drop by the
 /// caller (`vault-core` owns the lifecycle; doc §11).
@@ -24,6 +25,37 @@ pub struct UnlockSecret<'a> {
     pub passphrase: &'a [u8],
     /// PIM; 0 means "use the PRF default schedule".
     pub pim: u32,
+    /// Which KDFs the search may try. `Auto` tries everything; narrowing it
+    /// is how a user who knows their volume skips the other KDFs' cost.
+    pub kdf: KdfFilter,
+    /// Set from another thread to stop the search. Checked before every
+    /// derivation, so it takes effect within one derivation (one Argon2id
+    /// pass set cannot be interrupted partway).
+    pub cancel: Option<&'a AtomicBool>,
+}
+
+impl<'a> UnlockSecret<'a> {
+    /// Passphrase + PIM with every KDF allowed and no cancel handle.
+    pub fn new(passphrase: &'a [u8], pim: u32) -> Self {
+        Self {
+            passphrase,
+            pim,
+            kdf: KdfFilter::Auto,
+            cancel: None,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    fn check_cancel(&self) -> VcResult<()> {
+        if self.cancelled() {
+            Err(VcError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// Progress callback so a wrong password on an old phone doesn't look like a
@@ -129,10 +161,17 @@ pub fn find_header_at(
         container.read_at(offset, &mut salt)?;
         let mut enc = [0u8; consts::HEADER_ENC_LEN];
         container.read_at(offset + consts::SALT_LEN as u64, &mut enc)?;
-        slots.push(Slot { position, salt, enc });
+        slots.push(Slot {
+            position,
+            salt,
+            enc,
+        });
     }
 
-    let prfs = vc_types::registry::PRFS;
+    let prfs: Vec<&'static vc_types::Prf> = vc_types::registry::PRFS
+        .iter()
+        .filter(|p| secret.kdf.allows(p.kdf))
+        .collect();
     let total = slots.len() * prfs.len();
 
     // A magic match with a bad CRC or refused flags is a *finding*, not a
@@ -140,46 +179,23 @@ pub fn find_header_at(
     let mut best_finding: Option<VcError> = None;
     let mut step = 0usize;
 
-    // Fast path: the default PRF (first in popularity order) at the primary
-    // slot alone. A stock SHA-512 container opened with its outer/normal
-    // password returns here after a single derivation — the cheapest possible
-    // unlock, with no regression on low-core devices.
-    let default_prf = &prfs[0];
-    if let Some(first) = slots.first() {
-        progress(step, total, default_prf.name);
-        step += 1;
-        let key = derive_for(default_prf, secret, &first.salt, max_key_len)?;
-        match try_schemes(&supported, &key, &first.enc, first.position) {
-            SchemeOutcome::Found(header, scheme) => {
-                return Ok(FoundHeader {
-                    header: *header,
-                    scheme,
-                    prf: default_prf,
-                })
-            }
-            SchemeOutcome::Finding(e) => best_finding = Some(e),
-            SchemeOutcome::Miss => {}
-        }
-    }
+    // The first allowed KDF gets the fast path when it is PBKDF2 (SHA-512
+    // unless filtered out). An Argon2id-only search has no fast path: it
+    // starts straight at the sequential sweep below.
+    let mut rest = &prfs[..];
+    if let Some(&default_prf) = prfs.first().filter(|p| p.kdf == vc_types::Kdf::Pbkdf2) {
+        rest = &prfs[1..];
 
-    // Default PRF across the *remaining* slots, in parallel. This is where a
-    // hidden SHA-512 volume is found — its header lives in the Hidden slot, so
-    // sweeping the default PRF straight there means the hidden unlock no longer
-    // waits for the other PRFs to be tried at the primary slot first (that wait
-    // was the bulk of the extra hidden-unlock latency).
-    if slots.len() > 1 {
-        let rest = &slots[1..];
-        let keys: Vec<VcResult<vc_crypto::HeaderKey>> = std::thread::scope(|s| {
-            let handles: Vec<_> = rest
-                .iter()
-                .map(|slot| s.spawn(|| derive_for(default_prf, secret, &slot.salt, max_key_len)))
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        for (slot, key) in rest.iter().zip(keys) {
+        // Fast path: the default PRF at the primary slot alone. A stock
+        // SHA-512 container opened with its outer/normal password returns
+        // here after a single derivation — the cheapest possible unlock,
+        // with no regression on low-core devices.
+        if let Some(first) = slots.first() {
+            secret.check_cancel()?;
             progress(step, total, default_prf.name);
             step += 1;
-            match try_schemes(&supported, &key?, &slot.enc, slot.position) {
+            let key = derive_for(default_prf, secret, &first.salt, max_key_len)?;
+            match try_schemes(&supported, &key, &first.enc, first.position) {
                 SchemeOutcome::Found(header, scheme) => {
                     return Ok(FoundHeader {
                         header: *header,
@@ -191,21 +207,58 @@ pub fn find_header_at(
                 SchemeOutcome::Miss => {}
             }
         }
+
+        // Default PRF across the *remaining* slots, in parallel. This is
+        // where a hidden SHA-512 volume is found — its header lives in the
+        // Hidden slot, so sweeping the default PRF straight there means the
+        // hidden unlock no longer waits for the other PRFs to be tried at
+        // the primary slot first (that wait was the bulk of the extra
+        // hidden-unlock latency).
+        if slots.len() > 1 {
+            secret.check_cancel()?;
+            let others = &slots[1..];
+            let keys: Vec<VcResult<vc_crypto::HeaderKey>> = std::thread::scope(|s| {
+                let handles: Vec<_> = others
+                    .iter()
+                    .map(|slot| {
+                        s.spawn(|| derive_for(default_prf, secret, &slot.salt, max_key_len))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (slot, key) in others.iter().zip(keys) {
+                progress(step, total, default_prf.name);
+                step += 1;
+                match try_schemes(&supported, &key?, &slot.enc, slot.position) {
+                    SchemeOutcome::Found(header, scheme) => {
+                        return Ok(FoundHeader {
+                            header: *header,
+                            scheme,
+                            prf: default_prf,
+                        })
+                    }
+                    SchemeOutcome::Finding(e) => best_finding = Some(e),
+                    SchemeOutcome::Miss => {}
+                }
+            }
+        }
     }
 
-    // Remaining PRFs, each swept across every slot. A wrong password reaches
-    // the end of this, deriving every (PRF, slot) pair before failing — so
-    // unlock time is independent of whether a hidden volume exists, and
-    // probing the hidden slot leaves no trace (doc §11).
+    // Remaining KDFs, each swept across every slot. A wrong password reaches
+    // the end of this, deriving every (KDF, slot) pair the filter allows
+    // before failing — so unlock time is independent of whether a hidden
+    // volume exists, and probing the hidden slot leaves no trace (doc §11).
     //
     // PBKDF2 PRFs sweep the slots in parallel. Argon2id sweeps them one at a
     // time through a single reused buffer: at the default PIM each derivation
     // holds 416 MiB, so four slots at once would need ~1.6 GiB (4 GiB at the
     // 1 GiB cap), more than many phones can give an app.
-    for prf in prfs.iter().skip(1) {
+    for &prf in rest {
+        secret.check_cancel()?;
         if prf.kdf == vc_types::Kdf::Argon2id {
             let mut memory = vc_crypto::Argon2Memory::for_pim(secret.pim)?;
             for slot in &slots {
+                secret.check_cancel()?;
                 progress(step, total, prf.name);
                 step += 1;
                 let key = vc_crypto::derive_argon2id(
@@ -253,6 +306,9 @@ pub fn find_header_at(
         }
     }
 
+    // A cancel that landed during the last derivation still wins over a
+    // wrong-password verdict: the user asked to stop, not to be told no.
+    secret.check_cancel()?;
     Err(best_finding.unwrap_or(VcError::NotFoundOrWrongPassword))
 }
 

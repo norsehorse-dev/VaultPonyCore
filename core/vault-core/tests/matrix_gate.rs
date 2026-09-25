@@ -36,9 +36,9 @@ fn p1_gate_every_corpus_fixture_unlocks_with_matching_params() {
             missing += 1;
             continue;
         }
-        // Hidden fixtures carry outer/hidden passwords, not a single
-        // `password`; they have their own gate (hidden_gate.rs).
-        if entry["kind"] == "hidden" {
+        // Special kinds (hidden, hidden-mixed, keyfile) carry their own
+        // secrets and have their own gates (hidden_gate.rs, argon2id_gate.rs).
+        if entry["kind"].is_string() {
             continue;
         }
         let params = &entry["params"];
@@ -54,10 +54,10 @@ fn p1_gate_every_corpus_fixture_unlocks_with_matching_params() {
                 continue;
             }
         };
-        let secret = UnlockSecret {
-            passphrase: params["password"].as_str().unwrap().as_bytes(),
-            pim: params["pim"].as_u64().unwrap() as u32,
-        };
+        let secret = UnlockSecret::new(
+            params["password"].as_str().unwrap().as_bytes(),
+            params["pim"].as_u64().unwrap() as u32,
+        );
         match find_header(&mut dev, &secret, &mut |_, _, _| {}) {
             Ok(found) => {
                 let want_scheme = params["scheme"].as_str().unwrap();

@@ -94,20 +94,14 @@ fn outer_password_opens_a_different_volume_and_never_the_hidden_tree() {
     let mut dev = FileDevice::open_read(&container).unwrap();
     let outer = find_header(
         &mut dev,
-        &UnlockSecret {
-            passphrase: outer_pw.as_bytes(),
-            pim: 0,
-        },
+        &UnlockSecret::new(outer_pw.as_bytes(), 0),
         &mut |_, _, _| {},
     )
     .unwrap();
     let mut dev = FileDevice::open_read(&container).unwrap();
     let hidden = find_header(
         &mut dev,
-        &UnlockSecret {
-            passphrase: hidden_pw.as_bytes(),
-            pim: 0,
-        },
+        &UnlockSecret::new(hidden_pw.as_bytes(), 0),
         &mut |_, _, _| {},
     )
     .unwrap();

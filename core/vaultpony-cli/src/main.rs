@@ -7,10 +7,12 @@
 //! License note: apps are GPL-3.0 under the proposed split (doc §14, open
 //! decision §16); flip here and in Cargo.toml if that decision changes.
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::OnceLock;
+use vault_core::{KdfFilter, UnlockSecret};
 use zeroize::Zeroizing;
 
 #[derive(Parser)]
@@ -22,6 +24,29 @@ use zeroize::Zeroizing;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Which KDFs to try when opening a volume. "auto" tries all, like
+    /// VeraCrypt; "argon2id" skips the PBKDF2 sweep for Argon2id volumes,
+    /// "pbkdf2" skips Argon2id's memory and time for PBKDF2 volumes.
+    #[arg(long, global = true, value_enum, default_value_t = KdfArg::Auto)]
+    kdf: KdfArg,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum KdfArg {
+    Auto,
+    Pbkdf2,
+    Argon2id,
+}
+
+static KDF: OnceLock<KdfFilter> = OnceLock::new();
+
+/// The unlock secret every command uses: passphrase + PIM under the global
+/// `--kdf` choice.
+fn secret(passphrase: &[u8], pim: u32) -> UnlockSecret<'_> {
+    UnlockSecret {
+        kdf: KDF.get().copied().unwrap_or_default(),
+        ..UnlockSecret::new(passphrase, pim)
+    }
 }
 
 #[derive(Subcommand)]
@@ -184,13 +209,14 @@ fn cmd_info(container: PathBuf, pim: u32, keyfiles: Vec<PathBuf>) -> ExitCode {
         Err(code) => return code,
     };
     let mut last = String::new();
-    let result = vault_core::probe(&container, &secret, pim, &mut |i, n, prf| {
-        if std::io::stderr().is_terminal() {
-            last = format!("trying {prf} ({}/{n})...", i + 1);
-            eprint!("\r{last}");
-            let _ = std::io::stderr().flush();
-        }
-    });
+    let result =
+        vault_core::probe_with(&container, &self::secret(&secret, pim), &mut |i, n, prf| {
+            if std::io::stderr().is_terminal() {
+                last = format!("trying {prf} ({}/{n})...", i + 1);
+                eprint!("\r{last}");
+                let _ = std::io::stderr().flush();
+            }
+        });
     if !last.is_empty() {
         eprintln!();
     }
@@ -233,14 +259,24 @@ fn unlock_mode(
 ) -> Result<vault_core::Session, ExitCode> {
     let secret = effective_secret(keyfiles)?;
     let mut last = String::new();
-    let session =
-        vault_core::Session::unlock_with(container, &secret, pim, writable, &mut |i, n, prf| {
-            if std::io::stderr().is_terminal() {
-                last = format!("trying {prf} ({}/{n})...", i + 1);
-                eprint!("\r{last}");
-                let _ = std::io::stderr().flush();
-            }
-        });
+    let dev = if writable {
+        vc_io::FileDevice::open_rw(container)
+    } else {
+        vc_io::FileDevice::open_read(container)
+    };
+    let session = dev.and_then(|dev| {
+        vault_core::Session::unlock_device_with(
+            Box::new(dev),
+            &self::secret(&secret, pim),
+            &mut |i, n, prf| {
+                if std::io::stderr().is_terminal() {
+                    last = format!("trying {prf} ({}/{n})...", i + 1);
+                    eprint!("\r{last}");
+                    let _ = std::io::stderr().flush();
+                }
+            },
+        )
+    });
     if !last.is_empty() {
         eprintln!();
     }
@@ -339,17 +375,19 @@ fn unlock_protected(
             )
         }
     };
-    vault_core::Session::unlock_outer_protected(
-        container,
-        &outer,
-        hidden.as_bytes(),
-        pim,
-        &mut |_, _, _| {},
-    )
-    .map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::FAILURE
-    })
+    vc_io::FileDevice::open_rw(container)
+        .and_then(|dev| {
+            vault_core::Session::unlock_outer_protected_device_with(
+                Box::new(dev),
+                &secret(&outer, pim),
+                hidden.as_bytes(),
+                &mut |_, _, _| {},
+            )
+        })
+        .map_err(|e| {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        })
 }
 
 fn cmd_add(
@@ -430,10 +468,7 @@ fn cmd_header_restore(container: PathBuf, from_file: Option<PathBuf>, pim: u32) 
             return ExitCode::FAILURE;
         }
     };
-    let secret = vc_format::UnlockSecret {
-        passphrase: passphrase.as_bytes(),
-        pim,
-    };
+    let secret = secret(passphrase.as_bytes(), pim);
     let result = vc_io::FileDevice::open_rw(&container).and_then(|mut dev| match &from_file {
         Some(path) => {
             let backup = std::fs::read(path)?;
@@ -486,6 +521,11 @@ fn cmd_extract(
 fn main() -> ExitCode {
     env_logger::init();
     let cli = Cli::parse();
+    let _ = KDF.set(match cli.kdf {
+        KdfArg::Auto => KdfFilter::Auto,
+        KdfArg::Pbkdf2 => KdfFilter::Pbkdf2Only,
+        KdfArg::Argon2id => KdfFilter::Argon2idOnly,
+    });
     match cli.command {
         Command::Create {
             container,
@@ -504,7 +544,15 @@ fn main() -> ExitCode {
             hash,
             pim,
             filesystem,
-        } => cmd_create_hidden(container, size, hidden_size, encryption, hash, pim, filesystem),
+        } => cmd_create_hidden(
+            container,
+            size,
+            hidden_size,
+            encryption,
+            hash,
+            pim,
+            filesystem,
+        ),
         Command::Info {
             container,
             pim,
@@ -723,7 +771,9 @@ fn cmd_create(
     };
     match vault_core::create_container(Box::new(dev), &params, fs) {
         Ok(()) => {
-            eprintln!("created {encryption} / {hash} / {filesystem} container with an empty filesystem");
+            eprintln!(
+                "created {encryption} / {hash} / {filesystem} container with an empty filesystem"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

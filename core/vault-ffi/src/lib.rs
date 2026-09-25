@@ -12,7 +12,8 @@
 //! (tracked in THREAT_MODEL.md review gates). No error message crossing
 //! this boundary carries names, paths, or key material.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use vc_types::VcError;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -53,6 +54,70 @@ pub fn hashes() -> Vec<String> {
 #[uniffi::export]
 pub fn filesystems() -> Vec<String> {
     vec!["FAT".to_string(), "exFAT".to_string()]
+}
+
+/// Which KDFs an unlock may try. `Auto` matches VeraCrypt (everything);
+/// the narrow choices skip the other family's cost entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KdfFilter {
+    Auto,
+    Pbkdf2Only,
+    Argon2idOnly,
+}
+
+impl From<KdfFilter> for vc_types::KdfFilter {
+    fn from(f: KdfFilter) -> Self {
+        match f {
+            KdfFilter::Auto => vc_types::KdfFilter::Auto,
+            KdfFilter::Pbkdf2Only => vc_types::KdfFilter::Pbkdf2Only,
+            KdfFilter::Argon2idOnly => vc_types::KdfFilter::Argon2idOnly,
+        }
+    }
+}
+
+/// Memory one Argon2id derivation needs at `pim` (0 = default), in MiB, so
+/// a shell can check free memory before starting an unlock that may run it.
+#[uniffi::export]
+pub fn argon2_memory_mib(pim: u32) -> u32 {
+    vc_types::registry::argon2_cost(pim).memory_mib()
+}
+
+/// A cancel handle for one unlock-style call. Create it, pass it in, and
+/// call `cancel()` from any thread; the call returns `Cancelled` before its
+/// next key derivation. Nothing is written by a cancelled call.
+#[derive(uniffi::Object, Default)]
+pub struct UnlockCancel {
+    flag: AtomicBool,
+}
+
+#[uniffi::export]
+impl UnlockCancel {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn cancel(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
+fn secret<'a>(
+    passphrase: &'a [u8],
+    pim: u32,
+    kdf: KdfFilter,
+    cancel: &'a Option<Arc<UnlockCancel>>,
+) -> vault_core::UnlockSecret<'a> {
+    vault_core::UnlockSecret {
+        passphrase,
+        pim,
+        kdf: kdf.into(),
+        cancel: cancel.as_deref().map(|c| &c.flag),
+    }
 }
 
 fn parse_fs(name: &str) -> FfiResult<vault_core::ContainerFs> {
@@ -213,15 +278,21 @@ pub fn restore_header_from_file(
     passphrase: String,
     pim: u32,
     keyfiles: Vec<Vec<u8>>,
+    kdf: KdfFilter,
+    cancel: Option<Arc<UnlockCancel>>,
 ) -> FfiResult<()> {
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
-    let secret = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+    let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
     }
     let mut dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
-    vault_core::restore_header_from_file(&mut dev, &backup, &secret, pim)?;
+    vault_core::restore_header_from_file_with(
+        &mut dev,
+        &backup,
+        &secret(&effective, pim, kdf, &cancel),
+    )?;
     Ok(())
 }
 
@@ -233,15 +304,20 @@ pub fn restore_header_from_embedded(
     passphrase: String,
     pim: u32,
     keyfiles: Vec<Vec<u8>>,
+    kdf: KdfFilter,
+    cancel: Option<Arc<UnlockCancel>>,
 ) -> FfiResult<()> {
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
-    let secret = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+    let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
     }
     let mut dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
-    vault_core::restore_header_from_embedded(&mut dev, &secret, pim)?;
+    vault_core::restore_header_from_embedded_with(
+        &mut dev,
+        &secret(&effective, pim, kdf, &cancel),
+    )?;
     Ok(())
 }
 
@@ -260,6 +336,8 @@ pub fn change_password(
     new_passphrase: String,
     new_pim: u32,
     new_keyfiles: Vec<Vec<u8>>,
+    kdf: KdfFilter,
+    cancel: Option<Arc<UnlockCancel>>,
 ) -> FfiResult<()> {
     let old_passphrase = Zeroizing::new(old_passphrase);
     let new_passphrase = Zeroizing::new(new_passphrase);
@@ -271,7 +349,11 @@ pub fn change_password(
         kf.zeroize();
     }
     let mut dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
-    vault_core::change_password(&mut dev, &old_secret, old_pim, &new_secret, new_pim)?;
+    vault_core::change_password_with(
+        &mut dev,
+        &secret(&old_secret, old_pim, kdf, &cancel),
+        &vault_core::UnlockSecret::new(&new_secret, new_pim),
+    )?;
     Ok(())
 }
 
@@ -304,6 +386,9 @@ pub enum VaultError {
     /// password: the shell should say so and can offer a PBKDF2-only retry.
     #[error("not enough free memory for Argon2id ({needed_mib} MiB needed)")]
     KdfOutOfMemory { needed_mib: u32 },
+    /// The caller's `UnlockCancel` fired. Nothing was written.
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<VcError> for VaultError {
@@ -326,6 +411,7 @@ impl From<VcError> for VaultError {
             },
             VcError::Internal(_) => VaultError::Internal,
             VcError::KdfOutOfMemory { needed_mib } => VaultError::KdfOutOfMemory { needed_mib },
+            VcError::Cancelled => VaultError::Cancelled,
         }
     }
 }
@@ -385,6 +471,8 @@ impl VaultSession {
         passphrase: String,
         pim: u32,
         keyfiles: Vec<Vec<u8>>,
+        kdf: KdfFilter,
+        cancel: Option<Arc<UnlockCancel>>,
         listener: Option<std::sync::Arc<dyn UnlockProgressListener>>,
     ) -> FfiResult<std::sync::Arc<Self>> {
         let passphrase = Zeroizing::new(passphrase);
@@ -403,8 +491,11 @@ impl VaultSession {
                 l.on_progress(step as u32, total as u32, prf.to_string());
             }
         };
-        let session =
-            vault_core::Session::unlock_device(Box::new(dev), &secret, pim, &mut progress)?;
+        let session = vault_core::Session::unlock_device_with(
+            Box::new(dev),
+            &self::secret(&secret, pim, kdf, &cancel),
+            &mut progress,
+        )?;
         Ok(std::sync::Arc::new(Self {
             inner: Mutex::new(Some(session)),
         }))
@@ -428,6 +519,8 @@ impl VaultSession {
         outer_passphrase: String,
         hidden_passphrase: String,
         pim: u32,
+        kdf: KdfFilter,
+        cancel: Option<Arc<UnlockCancel>>,
         listener: Option<std::sync::Arc<dyn UnlockProgressListener>>,
     ) -> FfiResult<std::sync::Arc<Self>> {
         let outer_passphrase = Zeroizing::new(outer_passphrase);
@@ -439,11 +532,10 @@ impl VaultSession {
                 l.on_progress(step as u32, total as u32, prf.to_string());
             }
         };
-        let session = vault_core::Session::unlock_outer_protected_device(
+        let session = vault_core::Session::unlock_outer_protected_device_with(
             Box::new(dev),
-            outer_passphrase.as_bytes(),
+            &secret(outer_passphrase.as_bytes(), pim, kdf, &cancel),
             hidden_passphrase.as_bytes(),
-            pim,
             &mut progress,
         )?;
         Ok(std::sync::Arc::new(Self {
@@ -513,7 +605,9 @@ impl VaultSession {
 
     /// Write `data` at `offset`, returning bytes written.
     pub fn write_at(&self, path: String, offset: u64, data: Vec<u8>) -> FfiResult<u32> {
-        with_session(&self.inner, |s| Ok(s.vfs().write_at(&path, offset, &data)? as u32))
+        with_session(&self.inner, |s| {
+            Ok(s.vfs().write_at(&path, offset, &data)? as u32)
+        })
     }
 
     /// Create an empty regular file (errors if it already exists).
@@ -593,7 +687,16 @@ mod tests {
             eprintln!("SKIP: fixture corpus not present");
             return;
         };
-        let s = VaultSession::unlock_fd(fd, "vaultpony-fixture".into(), 0, Vec::new(), None).unwrap();
+        let s = VaultSession::unlock_fd(
+            fd,
+            "vaultpony-fixture".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None,
+        )
+        .unwrap();
         let facts = s.facts().unwrap();
         assert_eq!(facts.scheme, "AES");
         assert_eq!(facts.filesystem, "Fat");
@@ -645,7 +748,9 @@ mod tests {
 
         for pw in ["outer-ffi", "hidden-ffi"] {
             let dfd = std::fs::File::open(&tmp).unwrap().into_raw_fd();
-            let s = VaultSession::unlock_fd(dfd, pw.into(), 0, Vec::new(), None).unwrap();
+            let s =
+                VaultSession::unlock_fd(dfd, pw.into(), 0, Vec::new(), KdfFilter::Auto, None, None)
+                    .unwrap();
             // Fresh FAT root lists without error.
             s.list("/".into()).unwrap();
             s.lock();
@@ -689,6 +794,8 @@ mod tests {
             "outer-prot".into(),
             "hidden-prot".into(),
             0,
+            KdfFilter::Auto,
+            None,
             None,
         )
         .unwrap();
@@ -711,6 +818,8 @@ mod tests {
             "outer-prot".into(),
             "wrong-hidden".into(),
             0,
+            KdfFilter::Auto,
+            None,
             None,
         ) {
             Err(VaultError::NotFoundOrWrongPassword) => {}
@@ -771,20 +880,62 @@ mod tests {
         // container's own tail backup, then wreck BOTH tail backups — unlock
         // must still work, proving the primary was actually rewritten.
         corrupt(0, 65536);
-        restore_header_from_embedded(open(true), "recover-me".into(), 0, Vec::new()).unwrap();
+        restore_header_from_embedded(
+            open(true),
+            "recover-me".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+        )
+        .unwrap();
         corrupt(size - 131072, 131072);
-        VaultSession::unlock_fd(open(false), "recover-me".into(), 0, Vec::new(), None)
-            .unwrap()
-            .lock();
+        VaultSession::unlock_fd(
+            open(false),
+            "recover-me".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None,
+        )
+        .unwrap()
+        .lock();
 
         // File restore: now every on-disk header slot is garbage; only the
         // exported file can bring it back.
         corrupt(0, 131072);
-        assert!(VaultSession::unlock_fd(open(false), "recover-me".into(), 0, Vec::new(), None).is_err());
-        restore_header_from_file(open(true), backup, "recover-me".into(), 0, Vec::new()).unwrap();
-        VaultSession::unlock_fd(open(false), "recover-me".into(), 0, Vec::new(), None)
-            .unwrap()
-            .lock();
+        assert!(VaultSession::unlock_fd(
+            open(false),
+            "recover-me".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None
+        )
+        .is_err());
+        restore_header_from_file(
+            open(true),
+            backup,
+            "recover-me".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+        )
+        .unwrap();
+        VaultSession::unlock_fd(
+            open(false),
+            "recover-me".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None,
+        )
+        .unwrap()
+        .lock();
 
         let _ = std::fs::remove_file(&tmp);
     }
@@ -824,9 +975,19 @@ mod tests {
             .unwrap();
         }
         {
-            let s = VaultSession::unlock_fd(open(true), "old-pass".into(), 0, Vec::new(), None).unwrap();
+            let s = VaultSession::unlock_fd(
+                open(true),
+                "old-pass".into(),
+                0,
+                Vec::new(),
+                KdfFilter::Auto,
+                None,
+                None,
+            )
+            .unwrap();
             s.create("/keep.txt".into()).unwrap();
-            s.write_at("/keep.txt".into(), 0, b"survive".to_vec()).unwrap();
+            s.write_at("/keep.txt".into(), 0, b"survive".to_vec())
+                .unwrap();
             s.flush().unwrap();
             s.lock();
         }
@@ -839,13 +1000,33 @@ mod tests {
             "new-pass".into(),
             0,
             Vec::new(),
+            KdfFilter::Auto,
+            None,
         )
         .unwrap();
 
         // Old password no longer works.
-        assert!(VaultSession::unlock_fd(open(false), "old-pass".into(), 0, Vec::new(), None).is_err());
+        assert!(VaultSession::unlock_fd(
+            open(false),
+            "old-pass".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None
+        )
+        .is_err());
         // New password works and the file is intact — master keys unchanged.
-        let s = VaultSession::unlock_fd(open(true), "new-pass".into(), 0, Vec::new(), None).unwrap();
+        let s = VaultSession::unlock_fd(
+            open(true),
+            "new-pass".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None,
+        )
+        .unwrap();
         let data = s.read_at("/keep.txt".into(), 0, 64).unwrap();
         assert_eq!(&data, b"survive");
         s.lock();
@@ -859,7 +1040,15 @@ mod tests {
             eprintln!("SKIP: fixture corpus not present");
             return;
         };
-        match VaultSession::unlock_fd(fd, "nope".into(), 0, Vec::new(), None) {
+        match VaultSession::unlock_fd(
+            fd,
+            "nope".into(),
+            0,
+            Vec::new(),
+            KdfFilter::Auto,
+            None,
+            None,
+        ) {
             Err(VaultError::NotFoundOrWrongPassword) => {}
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("wrong password unlocked"),

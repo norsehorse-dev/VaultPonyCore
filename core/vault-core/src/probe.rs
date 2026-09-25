@@ -51,8 +51,17 @@ pub fn probe(
     pim: u32,
     progress: &mut UnlockProgress<'_>,
 ) -> VcResult<VolumeInfo> {
+    probe_with(path, &UnlockSecret::new(passphrase, pim), progress)
+}
+
+/// [`probe`] with the full secret (KDF filter, cancel flag).
+pub fn probe_with(
+    path: &Path,
+    secret: &UnlockSecret<'_>,
+    progress: &mut UnlockProgress<'_>,
+) -> VcResult<VolumeInfo> {
     let mut dev = FileDevice::open_read(path)?;
-    let found = find_header(&mut dev, &UnlockSecret { passphrase, pim }, progress)?;
+    let found = find_header(&mut dev, secret, progress)?;
 
     // Decrypt the first 4 KiB of the data area to identify the filesystem.
     // Data-unit numbers are absolute: container offset / 512 (doc §6).

@@ -7,11 +7,12 @@
 pub mod probe;
 pub mod session;
 
-pub use probe::{probe, HeaderSource, VolumeInfo};
+pub use probe::{probe, probe_with, HeaderSource, VolumeInfo};
 pub use session::{
     create_container, create_container_with_hidden, ContainerFs, Session, SessionId,
 };
-pub use vc_format::CreateParams;
+pub use vc_format::{CreateParams, UnlockSecret};
+pub use vc_types::KdfFilter;
 
 use vc_types::VcResult;
 
@@ -37,7 +38,7 @@ pub fn restore_header_from_file(
     vc_format::repair::restore_from_file(
         dev,
         backup,
-        &vc_format::UnlockSecret { passphrase, pim },
+        &vc_format::UnlockSecret::new(passphrase, pim),
     )
     .map(|_| ())
 }
@@ -52,7 +53,7 @@ pub fn restore_header_from_embedded(
 ) -> VcResult<()> {
     vc_format::repair::restore_primary_from_embedded(
         dev,
-        &vc_format::UnlockSecret { passphrase, pim },
+        &vc_format::UnlockSecret::new(passphrase, pim),
     )
     .map(|_| ())
 }
@@ -70,15 +71,37 @@ pub fn change_password(
 ) -> VcResult<()> {
     vc_format::repair::change_password(
         dev,
-        &vc_format::UnlockSecret {
-            passphrase: old_passphrase,
-            pim: old_pim,
-        },
-        &vc_format::UnlockSecret {
-            passphrase: new_passphrase,
-            pim: new_pim,
-        },
+        &vc_format::UnlockSecret::new(old_passphrase, old_pim),
+        &vc_format::UnlockSecret::new(new_passphrase, new_pim),
     )
+}
+
+/// [`restore_header_from_file`] with the full secret (KDF filter, cancel).
+pub fn restore_header_from_file_with(
+    dev: &mut dyn vc_io::BlockDevice,
+    backup: &[u8],
+    secret: &vc_format::UnlockSecret<'_>,
+) -> VcResult<()> {
+    vc_format::repair::restore_from_file(dev, backup, secret).map(|_| ())
+}
+
+/// [`restore_header_from_embedded`] with the full secret (KDF filter, cancel).
+pub fn restore_header_from_embedded_with(
+    dev: &mut dyn vc_io::BlockDevice,
+    secret: &vc_format::UnlockSecret<'_>,
+) -> VcResult<()> {
+    vc_format::repair::restore_primary_from_embedded(dev, secret).map(|_| ())
+}
+
+/// [`change_password`] with full secrets. The old secret's KDF filter and
+/// cancel flag govern the search for the volume; cancelling can only land
+/// before anything is written.
+pub fn change_password_with(
+    dev: &mut dyn vc_io::BlockDevice,
+    old: &vc_format::UnlockSecret<'_>,
+    new: &vc_format::UnlockSecret<'_>,
+) -> VcResult<()> {
+    vc_format::repair::change_password(dev, old, new)
 }
 
 /// Core version string, threaded through to every shell's about screen and

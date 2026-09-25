@@ -30,7 +30,8 @@ fn extraction_gate_every_populated_fixture_reads_byte_identical() {
 
     let mut verified_fixtures = 0usize;
     for (id, entry) in manifest["fixtures"].as_object().unwrap() {
-        if entry["status"] != "ok" {
+        // Special kinds carry their own secrets and gates.
+        if entry["status"] != "ok" || entry["kind"].is_string() {
             continue;
         }
         let Some(tree) = entry["tree"].as_object() else {

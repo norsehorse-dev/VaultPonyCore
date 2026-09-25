@@ -49,6 +49,10 @@ pub enum VcError {
     #[error("not enough free memory for Argon2id ({needed_mib} MiB needed)")]
     KdfOutOfMemory { needed_mib: u32 },
 
+    /// The user stopped the unlock search. Nothing was written.
+    #[error("unlock cancelled")]
+    Cancelled,
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

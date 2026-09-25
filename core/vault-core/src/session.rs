@@ -53,10 +53,7 @@ fn format_data(
     let secret = vc_crypto::apply_keyfiles(params.passphrase, params.keyfiles);
     let found = find_header(
         dev.as_mut(),
-        &UnlockSecret {
-            passphrase: secret.as_slice(),
-            pim: params.pim,
-        },
+        &UnlockSecret::new(secret.as_slice(), params.pim),
         &mut |_, _, _| {},
     )?;
     let xts = vc_crypto::SchemeXts::new(
@@ -140,12 +137,23 @@ impl Session {
     /// point: shells hand a dup'd fd across FFI (`vc_io::RawFdDevice`) and
     /// the core never touches platform storage APIs (doc §5).
     pub fn unlock_device(
-        mut dev: Box<dyn vc_io::BlockDevice>,
+        dev: Box<dyn vc_io::BlockDevice>,
         passphrase: &[u8],
         pim: u32,
         progress: &mut UnlockProgress<'_>,
     ) -> VcResult<Self> {
-        let found = find_header(dev.as_mut(), &UnlockSecret { passphrase, pim }, progress)?;
+        Self::unlock_device_with(dev, &UnlockSecret::new(passphrase, pim), progress)
+    }
+
+    /// [`unlock_device`](Self::unlock_device) with the full secret: a KDF
+    /// filter to narrow the search and a cancel flag the shell can raise
+    /// from its UI thread.
+    pub fn unlock_device_with(
+        mut dev: Box<dyn vc_io::BlockDevice>,
+        secret: &UnlockSecret<'_>,
+        progress: &mut UnlockProgress<'_>,
+    ) -> VcResult<Self> {
+        let found = find_header(dev.as_mut(), secret, progress)?;
         let xts = vc_crypto::SchemeXts::new(
             found.scheme,
             &found.header.master_keys[..found.scheme.key_bytes()],
@@ -195,19 +203,35 @@ impl Session {
     /// exactly like `unlock_device`). Same contract and error behaviour as
     /// [`unlock_outer_protected`].
     pub fn unlock_outer_protected_device(
-        mut dev: Box<dyn vc_io::BlockDevice>,
+        dev: Box<dyn vc_io::BlockDevice>,
         outer_passphrase: &[u8],
         hidden_passphrase: &[u8],
         pim: u32,
         progress: &mut UnlockProgress<'_>,
     ) -> VcResult<Self> {
+        Self::unlock_outer_protected_device_with(
+            dev,
+            &UnlockSecret::new(outer_passphrase, pim),
+            hidden_passphrase,
+            progress,
+        )
+    }
+
+    /// [`unlock_outer_protected_device`](Self::unlock_outer_protected_device)
+    /// with the full outer secret. The hidden lookup reuses its PIM, KDF
+    /// filter and cancel flag with `hidden_passphrase`. The filter applies to
+    /// both lookups, so a user who narrows it must pick one that covers both
+    /// volumes (VeraCrypt lets outer and hidden use different KDFs).
+    pub fn unlock_outer_protected_device_with(
+        mut dev: Box<dyn vc_io::BlockDevice>,
+        outer_secret: &UnlockSecret<'_>,
+        hidden_passphrase: &[u8],
+        progress: &mut UnlockProgress<'_>,
+    ) -> VcResult<Self> {
         // Outer must resolve to a non-hidden slot.
         let outer = find_header_at(
             dev.as_mut(),
-            &UnlockSecret {
-                passphrase: outer_passphrase,
-                pim,
-            },
+            outer_secret,
             &[HeaderPosition::Primary, HeaderPosition::BackupPrimary],
             progress,
         )?;
@@ -218,7 +242,7 @@ impl Session {
             dev.as_mut(),
             &UnlockSecret {
                 passphrase: hidden_passphrase,
-                pim,
+                ..*outer_secret
             },
             &[HeaderPosition::Hidden, HeaderPosition::BackupHidden],
             &mut |_, _, _| {},

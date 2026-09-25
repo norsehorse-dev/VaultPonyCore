@@ -14,10 +14,7 @@ const PASSWORD: &[u8] = b"vaultpony-fixture";
 const FIXTURE: &str = "aes-sha_512-fat-512-pim0-plain.vc";
 
 fn secret() -> UnlockSecret<'static> {
-    UnlockSecret {
-        passphrase: PASSWORD,
-        pim: 0,
-    }
+    UnlockSecret::new(PASSWORD, 0)
 }
 
 fn fixture_copy(tag: &str) -> Option<PathBuf> {
@@ -58,14 +55,7 @@ fn destroyed_primary_unlocks_via_backup_and_restores() {
     // Wrong password: verify-then-write means nothing is written.
     let before = std::fs::read(&container).unwrap();
     let mut dev = FileDevice::open_rw(&container).unwrap();
-    let err = restore_primary_from_embedded(
-        &mut dev,
-        &UnlockSecret {
-            passphrase: b"nope",
-            pim: 0,
-        },
-    )
-    .unwrap_err();
+    let err = restore_primary_from_embedded(&mut dev, &UnlockSecret::new(b"nope", 0)).unwrap_err();
     assert!(matches!(err, VcError::NotFoundOrWrongPassword));
     drop(dev);
     assert_eq!(

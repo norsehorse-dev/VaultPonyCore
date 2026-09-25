@@ -81,10 +81,7 @@ fn created_containers_reopen_with_our_reader_across_the_matrix() {
 
         let found = find_header(
             &mut dev,
-            &UnlockSecret {
-                passphrase: b"correct horse",
-                pim: 0,
-            },
+            &UnlockSecret::new(b"correct horse", 0),
             &mut |_, _, _| {},
         )
         .unwrap_or_else(|e| panic!("{s}/{p}: reopen failed: {e}"));
@@ -110,14 +107,7 @@ fn created_containers_reopen_with_our_reader_across_the_matrix() {
     )
     .unwrap();
     assert!(matches!(
-        find_header(
-            &mut dev,
-            &UnlockSecret {
-                passphrase: b"nope",
-                pim: 0
-            },
-            &mut |_, _, _| {}
-        ),
+        find_header(&mut dev, &UnlockSecret::new(b"nope", 0), &mut |_, _, _| {}),
         Err(VcError::NotFoundOrWrongPassword)
     ));
 }
@@ -145,23 +135,13 @@ fn created_container_with_keyfile_needs_the_keyfile() {
     // Opens with password + keyfile.
     assert!(find_header(
         &mut dev,
-        &UnlockSecret {
-            passphrase: &secret_in,
-            pim: 0
-        },
+        &UnlockSecret::new(&secret_in, 0),
         &mut |_, _, _| {}
     )
     .is_ok());
     // Fails with password alone.
     assert!(matches!(
-        find_header(
-            &mut dev,
-            &UnlockSecret {
-                passphrase: b"pw",
-                pim: 0
-            },
-            &mut |_, _, _| {}
-        ),
+        find_header(&mut dev, &UnlockSecret::new(b"pw", 0), &mut |_, _, _| {}),
         Err(VcError::NotFoundOrWrongPassword)
     ));
 }

@@ -60,6 +60,29 @@ pub enum Kdf {
     Argon2id,
 }
 
+/// Which KDFs an unlock search may try. VeraCrypt itself always tries all
+/// of them; narrowing is a VaultPony convenience for users who know their
+/// volume, because an Argon2id-only search skips the whole PBKDF2 sweep and
+/// a PBKDF2-only search skips Argon2id's memory and time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum KdfFilter {
+    #[default]
+    Auto,
+    Pbkdf2Only,
+    Argon2idOnly,
+}
+
+impl KdfFilter {
+    pub const fn allows(self, kdf: Kdf) -> bool {
+        matches!(
+            (self, kdf),
+            (KdfFilter::Auto, _)
+                | (KdfFilter::Pbkdf2Only, Kdf::Pbkdf2)
+                | (KdfFilter::Argon2idOnly, Kdf::Argon2id)
+        )
+    }
+}
+
 /// Header-key derivation candidates, current VeraCrypt 1.26.x set: five
 /// PBKDF2 PRFs plus Argon2id. RIPEMD-160 dropped upstream; legacy support is
 /// a deliberate non-goal for now (doc §2, §4). The type keeps its PRF name
@@ -171,6 +194,29 @@ mod tests {
         // silently accept.
         assert_eq!(ENCRYPTION_SCHEMES.len(), 15);
         assert_eq!(PRFS.len(), 6);
+    }
+
+    #[test]
+    fn every_filter_allows_at_least_one_kdf() {
+        for f in [
+            KdfFilter::Auto,
+            KdfFilter::Pbkdf2Only,
+            KdfFilter::Argon2idOnly,
+        ] {
+            assert!(PRFS.iter().any(|p| f.allows(p.kdf)), "{f:?}");
+        }
+        assert_eq!(
+            PRFS.iter()
+                .filter(|p| KdfFilter::Argon2idOnly.allows(p.kdf))
+                .count(),
+            1
+        );
+        assert_eq!(
+            PRFS.iter()
+                .filter(|p| KdfFilter::Pbkdf2Only.allows(p.kdf))
+                .count(),
+            PRFS.len() - 1
+        );
     }
 
     #[test]
