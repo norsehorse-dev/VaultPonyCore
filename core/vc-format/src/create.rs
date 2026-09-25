@@ -121,6 +121,7 @@ pub fn create_volume(
     if !consts::SECTOR_SIZES.contains(&params.sector_size) {
         return Err(VcError::Internal("unsupported sector size".into()));
     }
+    vc_types::registry::check_password_for_pim(params.prf, params.pim, params.passphrase)?;
     let front_back = 2 * consts::BACKUP_STANDARD_FROM_END; // 256 KiB reserved
     if params.size < front_back + 512 {
         return Err(VcError::Internal("container too small".into()));
@@ -191,6 +192,7 @@ pub fn create_hidden(
     if !consts::SECTOR_SIZES.contains(&params.sector_size) {
         return Err(VcError::Internal("unsupported sector size".into()));
     }
+    vc_types::registry::check_password_for_pim(params.prf, params.pim, params.passphrase)?;
     // Hidden data ends at size − 262144 (VeraCrypt's placement). Require it to
     // sit inside the outer data area with at least 128 KiB of outer left.
     let hidden_end = params.size - 2 * consts::BACKUP_STANDARD_FROM_END; // size − 262144

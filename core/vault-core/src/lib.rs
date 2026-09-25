@@ -104,6 +104,20 @@ pub fn change_password_with(
     vc_format::repair::change_password(dev, old, new)
 }
 
+/// [`change_password_with`], optionally moving the header to another KDF
+/// (`new_prf`, `None` keeps the current one). `new.pim` is read under the
+/// new KDF, so PIM 0 means its default. `new_typed_password` is the new
+/// password before keyfiles, for VeraCrypt's low-PIM length rule.
+pub fn change_password_to(
+    dev: &mut dyn vc_io::BlockDevice,
+    old: &vc_format::UnlockSecret<'_>,
+    new: &vc_format::UnlockSecret<'_>,
+    new_prf: Option<&'static vc_types::Prf>,
+    new_typed_password: &[u8],
+) -> VcResult<()> {
+    vc_format::repair::change_password_to(dev, old, new, new_prf, new_typed_password)
+}
+
 /// Core version string, threaded through to every shell's about screen and
 /// used by the FFI walking skeleton to prove the toolchain end to end.
 pub fn core_version() -> String {

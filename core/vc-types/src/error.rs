@@ -49,6 +49,12 @@ pub enum VcError {
     #[error("not enough free memory for Argon2id ({needed_mib} MiB needed)")]
     KdfOutOfMemory { needed_mib: u32 },
 
+    /// A custom PIM below the KDF's default was paired with a short
+    /// password; VeraCrypt refuses the same combination (see
+    /// `registry::check_password_for_pim`).
+    #[error("a PIM below {default_pim} needs a password of at least {min_len} characters")]
+    PasswordTooShortForPim { min_len: usize, default_pim: u32 },
+
     /// The user stopped the unlock search. Nothing was written.
     #[error("unlock cancelled")]
     Cancelled,

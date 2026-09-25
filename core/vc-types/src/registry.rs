@@ -131,6 +131,36 @@ impl Argon2Cost {
     }
 }
 
+/// Passwords shorter than this may not be paired with an Argon2id PIM below
+/// the default (VeraCrypt's `VolumePassword::SmallPimPasswordSizeThreshold`).
+pub const SHORT_PIM_MIN_PASSWORD_LEN: usize = 20;
+
+/// VeraCrypt's rule for creating a header or setting a new password: a
+/// custom Argon2id PIM below the default (12) needs a password of at least
+/// [`SHORT_PIM_MIN_PASSWORD_LEN`] bytes, because the low cost leans on the
+/// password's own strength. An empty password (keyfiles only), PIM 0 and
+/// PIMs at or above the default are exempt. `password` is the typed
+/// password, before keyfiles are mixed in, as upstream checks it.
+///
+/// Upstream applies the same rule to PBKDF2 below PIM 485; VaultPony has
+/// not enforced that one so far and this check does not add it.
+pub fn check_password_for_pim(prf: &Prf, pim: u32, password: &[u8]) -> crate::VcResult<()> {
+    let default_pim = match prf.kdf {
+        Kdf::Argon2id => ARGON2_SCHEDULE.default_pim,
+        Kdf::Pbkdf2 => return Ok(()),
+    };
+    if password.is_empty() || pim == 0 || pim >= default_pim {
+        return Ok(());
+    }
+    if password.len() < SHORT_PIM_MIN_PASSWORD_LEN {
+        return Err(crate::VcError::PasswordTooShortForPim {
+            min_len: SHORT_PIM_MIN_PASSWORD_LEN,
+            default_pim,
+        });
+    }
+    Ok(())
+}
+
 /// Iterations for a given PIM under the non-system schedule (doc §4):
 /// `15000 + PIM * 1000`; PIM 0/absent means the PRF default. For Argon2id
 /// this is the pass count (what upstream's own `GetIterationCount` reports).
@@ -217,6 +247,22 @@ mod tests {
                 .count(),
             PRFS.len() - 1
         );
+    }
+
+    #[test]
+    fn short_password_rule_matches_upstream() {
+        let argon = PRFS.iter().find(|p| p.kdf == Kdf::Argon2id).unwrap();
+        let sha512 = &PRFS[0];
+        let short = b"short-password";
+        let long = b"a-password-of-twenty";
+        assert_eq!(long.len(), 20);
+        assert!(check_password_for_pim(argon, 1, short).is_err());
+        assert!(check_password_for_pim(argon, 11, short).is_err());
+        assert!(check_password_for_pim(argon, 1, long).is_ok());
+        assert!(check_password_for_pim(argon, 0, short).is_ok());
+        assert!(check_password_for_pim(argon, 12, short).is_ok());
+        assert!(check_password_for_pim(argon, 1, b"").is_ok());
+        assert!(check_password_for_pim(sha512, 1, short).is_ok());
     }
 
     #[test]

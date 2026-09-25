@@ -336,6 +336,7 @@ pub fn change_password(
     new_passphrase: String,
     new_pim: u32,
     new_keyfiles: Vec<Vec<u8>>,
+    new_prf: Option<String>,
     kdf: KdfFilter,
     cancel: Option<Arc<UnlockCancel>>,
 ) -> FfiResult<()> {
@@ -348,11 +349,23 @@ pub fn change_password(
     for kf in old_keyfiles.iter_mut().chain(new_keyfiles.iter_mut()) {
         kf.zeroize();
     }
+    // Adopt the fd before any early return so it is always closed.
     let mut dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
-    vault_core::change_password_with(
+    let new_prf = match new_prf {
+        None => None,
+        Some(name) => Some(
+            vc_types::registry::PRFS
+                .iter()
+                .find(|p| p.name == name)
+                .ok_or(VaultError::Internal)?,
+        ),
+    };
+    vault_core::change_password_to(
         &mut dev,
         &secret(&old_secret, old_pim, kdf, &cancel),
         &vault_core::UnlockSecret::new(&new_secret, new_pim),
+        new_prf,
+        new_passphrase.as_bytes(),
     )?;
     Ok(())
 }
@@ -389,6 +402,10 @@ pub enum VaultError {
     /// The caller's `UnlockCancel` fired. Nothing was written.
     #[error("cancelled")]
     Cancelled,
+    /// A custom PIM below `default_pim` needs a password of at least
+    /// `min_len` characters (VeraCrypt's rule; Argon2id only for now).
+    #[error("a PIM below {default_pim} needs a password of at least {min_len} characters")]
+    PasswordTooShortForPim { min_len: u32, default_pim: u32 },
 }
 
 impl From<VcError> for VaultError {
@@ -412,6 +429,13 @@ impl From<VcError> for VaultError {
             VcError::Internal(_) => VaultError::Internal,
             VcError::KdfOutOfMemory { needed_mib } => VaultError::KdfOutOfMemory { needed_mib },
             VcError::Cancelled => VaultError::Cancelled,
+            VcError::PasswordTooShortForPim {
+                min_len,
+                default_pim,
+            } => VaultError::PasswordTooShortForPim {
+                min_len: min_len as u32,
+                default_pim,
+            },
         }
     }
 }
@@ -1000,6 +1024,7 @@ mod tests {
             "new-pass".into(),
             0,
             Vec::new(),
+            None,
             KdfFilter::Auto,
             None,
         )

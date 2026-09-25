@@ -97,6 +97,26 @@ pub fn change_password(
     old: &UnlockSecret<'_>,
     new: &UnlockSecret<'_>,
 ) -> VcResult<()> {
+    change_password_to(dev, old, new, None, new.passphrase)
+}
+
+/// [`change_password`], optionally moving the header to another KDF
+/// (`new_prf`; `None` keeps the current one). Only the header key changes:
+/// master keys, cipher and data stay as they are, which is also how
+/// VeraCrypt's "change header KDF" works. `new.pim` is read under the new
+/// KDF's schedule, so PIM 0 means that KDF's default.
+///
+/// `new_typed_password` is the new password as typed, before keyfiles are
+/// mixed in; it is only used for VeraCrypt's low-PIM password-length rule
+/// ([`vc_types::registry::check_password_for_pim`]), which is checked against
+/// the KDF the header will end up with, before anything is written.
+pub fn change_password_to(
+    dev: &mut dyn vc_io::BlockDevice,
+    old: &UnlockSecret<'_>,
+    new: &UnlockSecret<'_>,
+    new_prf: Option<&'static vc_types::Prf>,
+    new_typed_password: &[u8],
+) -> VcResult<()> {
     let len = dev.len()?;
     // Identify the volume the OLD password opens, and its cipher/PRF.
     let found = find_header_at(
@@ -141,11 +161,17 @@ pub fn change_password(
             len - consts::BACKUP_STANDARD_FROM_END,
         )
     };
+    // Build both new header regions before writing either, so a failure
+    // while deriving (an Argon2id allocation, say) leaves the volume exactly
+    // as it was instead of with mismatched primary and backup headers.
+    let new_prf = new_prf.unwrap_or(prf);
+    vc_types::registry::check_password_for_pim(new_prf, new.pim, new_typed_password)?;
+    let mut regions = Vec::with_capacity(2);
     for off in [primary_off, backup_off] {
         let mut new_salt = [0u8; consts::SALT_LEN];
         getrandom::getrandom(&mut new_salt).map_err(|e| VcError::Internal(format!("rng: {e}")))?;
         let new_key = vc_crypto::derive_header_key_for(
-            prf,
+            new_prf,
             new.passphrase,
             &new_salt,
             new.pim,
@@ -157,7 +183,10 @@ pub fn change_password(
         let mut region = [0u8; consts::HEADER_REGION_LEN];
         region[..consts::SALT_LEN].copy_from_slice(&new_salt);
         region[consts::SALT_LEN..].copy_from_slice(&enc);
-        dev.write_at(off, &region)?;
+        regions.push((off, region));
+    }
+    for (off, region) in &regions {
+        dev.write_at(*off, region)?;
     }
     dev.flush()?;
 
