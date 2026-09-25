@@ -1,6 +1,7 @@
 //! Argon2id on the write side (VaultPony 1.1.0, P2): creating Argon2id
-//! containers, VeraCrypt's low-PIM password rule, moving a header between
-//! KDFs on a password change, and header restore on Argon2id volumes.
+//! containers, VeraCrypt's low-PIM password rule (Argon2id and PBKDF2),
+//! moving a header between KDFs on a password change, and header restore
+//! on Argon2id volumes.
 //!
 //! Needs no fixture corpus: every container is made in a temp file.
 //! VeraCrypt-side interop for these lives in argon2id_interop.rs.
@@ -112,13 +113,24 @@ fn create_applies_the_low_pim_password_rule() {
     }
     assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
 
+    // PBKDF2 gets the same rule below its default PIM (485).
+    match create(&path, &params("SHA-512", 1, SHORT_PW, &[])) {
+        Err(VcError::PasswordTooShortForPim {
+            min_len: 20,
+            default_pim: 485,
+        }) => {}
+        other => panic!("expected PasswordTooShortForPim, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+
     // The exemptions upstream makes: default PIM, PIM at the default, a
-    // keyfile-only (empty) password, and PBKDF2 (not enforced here).
+    // keyfile-only (empty) password, and a long password.
     create(&path, &params("Argon2id", 0, SHORT_PW, &[])).unwrap();
     create(&path, &params("Argon2id", 12, SHORT_PW, &[])).unwrap();
     let key = vec![(0..64u8).collect::<Vec<u8>>()];
     create(&path, &params("Argon2id", 1, b"", &key)).unwrap();
-    create(&path, &params("SHA-512", 1, SHORT_PW, &[])).unwrap();
+    create(&path, &params("SHA-512", 485, SHORT_PW, &[])).unwrap();
+    create(&path, &params("SHA-512", 1, LONG_PW, &[])).unwrap();
     let _ = std::fs::remove_file(&path);
 }
 
@@ -198,19 +210,41 @@ fn password_change_rule_uses_the_target_kdf_and_writes_nothing_on_refusal() {
     drop(dev);
     assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
 
-    // Keeping SHA-512 (None) with the same PIM and password is allowed.
+    // Keeping SHA-512 (None): the rule uses the kept KDF's default, 485.
+    let mut dev = FileDevice::open_rw(&path).unwrap();
+    let r = vault_core::change_password_to(
+        &mut dev,
+        &UnlockSecret::new(b"old-pass", 0),
+        &UnlockSecret::new(SHORT_PW, 1),
+        None,
+        SHORT_PW,
+    );
+    assert!(
+        matches!(
+            r,
+            Err(VcError::PasswordTooShortForPim {
+                default_pim: 485,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
+    drop(dev);
+    assert_eq!(std::fs::read(&path).unwrap(), before, "nothing written");
+
+    // At or above that default a short password is fine.
     let mut dev = FileDevice::open_rw(&path).unwrap();
     vault_core::change_password_to(
         &mut dev,
         &UnlockSecret::new(b"old-pass", 0),
-        &UnlockSecret::new(SHORT_PW, 1),
+        &UnlockSecret::new(SHORT_PW, 500),
         None,
         SHORT_PW,
     )
     .unwrap();
     drop(dev);
     assert_eq!(
-        open(&path, SHORT_PW, 1, KdfFilter::Pbkdf2Only, false)
+        open(&path, SHORT_PW, 500, KdfFilter::Pbkdf2Only, false)
             .unwrap()
             .prf(),
         "SHA-512"

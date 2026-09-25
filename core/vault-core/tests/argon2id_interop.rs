@@ -5,7 +5,12 @@
 //! and both are checked.
 //!
 //! Ignored by default: needs the VeraCrypt 1.26.29+ console with FUSE.
-//! Run with `cargo test --release -p vault-core --test argon2id_interop -- --ignored`.
+//! Run with `cargo test --release -p vault-core --test argon2id_interop --
+//! --ignored --test-threads 1`. The binary is `veracrypt` on PATH, or the
+//! `VERACRYPT` environment variable (on macOS:
+//! `/Applications/VeraCrypt.app/Contents/MacOS/VeraCrypt`, with macFUSE).
+//! Run explicitly without a usable VeraCrypt, these tests fail rather than
+//! skip, so a green run always means VeraCrypt really opened the volumes.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,8 +19,21 @@ use vc_io::FileDevice;
 
 const SIZE: u64 = 16 << 20;
 
+fn veracrypt() -> String {
+    std::env::var("VERACRYPT").unwrap_or_else(|_| "veracrypt".into())
+}
+
+/// Panics unless a VeraCrypt console that knows Argon2id is available.
+fn require_vc_with_argon2() {
+    assert!(
+        have_vc_with_argon2(),
+        "VeraCrypt 1.26.29+ console not found at `{}`; set VERACRYPT to its path",
+        veracrypt()
+    );
+}
+
 fn have_vc_with_argon2() -> bool {
-    Command::new("veracrypt")
+    Command::new(veracrypt())
         .args(["--text", "--version"])
         .output()
         .ok()
@@ -96,7 +114,7 @@ fn vc_properties(
     }
     args.push("--mount".into());
     args.push(path.to_string_lossy().into());
-    let mounted = Command::new("veracrypt")
+    let mounted = Command::new(veracrypt())
         .args(&args)
         .status()
         .map(|s| s.success())
@@ -104,12 +122,12 @@ fn vc_properties(
     if !mounted {
         return None;
     }
-    let out = Command::new("veracrypt")
+    let out = Command::new(veracrypt())
         .args(["--text", "--volume-properties"])
         .arg(path)
         .output()
         .unwrap();
-    let _ = Command::new("veracrypt")
+    let _ = Command::new(veracrypt())
         .args(["--text", "--dismount"])
         .arg(path)
         .status();
@@ -138,10 +156,7 @@ fn normal(kdf: &str) -> Option<(String, String)> {
 #[test]
 #[ignore = "needs the VeraCrypt 1.26.29+ console; run explicitly"]
 fn veracrypt_opens_our_argon2id_containers() {
-    if !have_vc_with_argon2() {
-        eprintln!("SKIP: VeraCrypt 1.26.29+ console not installed");
-        return;
-    }
+    require_vc_with_argon2();
     let long = "a-long-argon2id-password";
 
     for (s, pim) in [("Serpent(Twofish(AES))", 1), ("AES", 0), ("Camellia", 32)] {
@@ -176,10 +191,7 @@ fn veracrypt_opens_our_argon2id_containers() {
 #[test]
 #[ignore = "needs the VeraCrypt 1.26.29+ console; run explicitly"]
 fn veracrypt_opens_our_mixed_kdf_hidden_volume() {
-    if !have_vc_with_argon2() {
-        eprintln!("SKIP: VeraCrypt 1.26.29+ console not installed");
-        return;
-    }
+    require_vc_with_argon2();
     let path = temp("hidden");
     let outer = params("AES", "SHA-512", 0, b"outer-pass", &[]);
     let hidden = params("Twofish", "Argon2id", 0, b"hidden-pass", &[]);
@@ -206,10 +218,7 @@ fn veracrypt_opens_our_mixed_kdf_hidden_volume() {
 #[test]
 #[ignore = "needs the VeraCrypt 1.26.29+ console; run explicitly"]
 fn veracrypt_follows_our_kdf_changes() {
-    if !have_vc_with_argon2() {
-        eprintln!("SKIP: VeraCrypt 1.26.29+ console not installed");
-        return;
-    }
+    require_vc_with_argon2();
     let path = temp("rekey");
     create(
         &path,

@@ -135,20 +135,28 @@ impl Argon2Cost {
 /// the default (VeraCrypt's `VolumePassword::SmallPimPasswordSizeThreshold`).
 pub const SHORT_PIM_MIN_PASSWORD_LEN: usize = 20;
 
-/// VeraCrypt's rule for creating a header or setting a new password: a
-/// custom Argon2id PIM below the default (12) needs a password of at least
-/// [`SHORT_PIM_MIN_PASSWORD_LEN`] bytes, because the low cost leans on the
-/// password's own strength. An empty password (keyfiles only), PIM 0 and
-/// PIMs at or above the default are exempt. `password` is the typed
-/// password, before keyfiles are mixed in, as upstream checks it.
-///
-/// Upstream applies the same rule to PBKDF2 below PIM 485; VaultPony has
-/// not enforced that one so far and this check does not add it.
-pub fn check_password_for_pim(prf: &Prf, pim: u32, password: &[u8]) -> crate::VcResult<()> {
-    let default_pim = match prf.kdf {
+/// The PIM a KDF's default cost corresponds to: 12 for Argon2id, and for
+/// PBKDF2 the PIM whose iteration count equals the PRF default (485 for
+/// every current non-system PRF, i.e. 500,000 iterations).
+pub const fn default_pim(prf: &Prf) -> u32 {
+    match prf.kdf {
         Kdf::Argon2id => ARGON2_SCHEDULE.default_pim,
-        Kdf::Pbkdf2 => return Ok(()),
-    };
+        Kdf::Pbkdf2 => {
+            (prf.default_iterations - crate::consts::PIM_ITER_BASE)
+                / crate::consts::PIM_ITER_PER_UNIT
+        }
+    }
+}
+
+/// VeraCrypt's rule for creating a header or setting a new password: a
+/// custom PIM below the KDF's default ([`default_pim`]: 485 for PBKDF2, 12
+/// for Argon2id) needs a password of at least [`SHORT_PIM_MIN_PASSWORD_LEN`]
+/// bytes, because the lowered cost leans on the password's own strength. An
+/// empty password (keyfiles only), PIM 0 and PIMs at or above the default
+/// are exempt. `password` is the typed password, before keyfiles are mixed
+/// in, as upstream checks it. Opening existing volumes is never affected.
+pub fn check_password_for_pim(prf: &Prf, pim: u32, password: &[u8]) -> crate::VcResult<()> {
+    let default_pim = default_pim(prf);
     if password.is_empty() || pim == 0 || pim >= default_pim {
         return Ok(());
     }
@@ -262,7 +270,22 @@ mod tests {
         assert!(check_password_for_pim(argon, 0, short).is_ok());
         assert!(check_password_for_pim(argon, 12, short).is_ok());
         assert!(check_password_for_pim(argon, 1, b"").is_ok());
-        assert!(check_password_for_pim(sha512, 1, short).is_ok());
+
+        // PBKDF2: the same rule below PIM 485.
+        assert!(check_password_for_pim(sha512, 1, short).is_err());
+        assert!(check_password_for_pim(sha512, 484, short).is_err());
+        assert!(check_password_for_pim(sha512, 485, short).is_ok());
+        assert!(check_password_for_pim(sha512, 0, short).is_ok());
+        assert!(check_password_for_pim(sha512, 1, long).is_ok());
+        assert!(check_password_for_pim(sha512, 1, b"").is_ok());
+    }
+
+    #[test]
+    fn default_pims_match_upstream() {
+        for p in PRFS {
+            let want = if p.kdf == Kdf::Argon2id { 12 } else { 485 };
+            assert_eq!(default_pim(p), want, "{}", p.name);
+        }
     }
 
     #[test]

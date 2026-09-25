@@ -154,8 +154,14 @@ mod vc_interop {
     use std::path::Path;
     use std::process::Command;
 
+    /// `veracrypt` on PATH, or the `VERACRYPT` environment variable (on
+    /// macOS: `/Applications/VeraCrypt.app/Contents/MacOS/VeraCrypt`).
+    fn veracrypt() -> String {
+        std::env::var("VERACRYPT").unwrap_or_else(|_| "veracrypt".into())
+    }
+
     fn have_vc() -> bool {
-        Command::new("veracrypt")
+        Command::new(veracrypt())
             .arg("--text")
             .arg("--version")
             .output()
@@ -203,13 +209,13 @@ mod vc_interop {
         }
         args.push("--mount".into());
         args.push(path.to_string_lossy().into());
-        let ok = Command::new("veracrypt")
+        let ok = Command::new(veracrypt())
             .args(&args)
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
         if ok {
-            let _ = Command::new("veracrypt")
+            let _ = Command::new(veracrypt())
                 .args(["--text", "--dismount"])
                 .status();
         }
@@ -219,10 +225,12 @@ mod vc_interop {
     #[test]
     #[ignore = "needs the veracrypt console; run explicitly for the P10 gate"]
     fn veracrypt_opens_our_containers_and_keyfiles_interop() {
-        if !have_vc() {
-            eprintln!("SKIP: veracrypt not installed");
-            return;
-        }
+        // Run explicitly, a missing VeraCrypt is a failure, not a silent pass.
+        assert!(
+            have_vc(),
+            "VeraCrypt console not found at `{}`; set VERACRYPT to its path",
+            veracrypt()
+        );
         let dir = std::env::temp_dir();
         for (s, p) in [
             ("AES", "SHA-512"),

@@ -403,7 +403,8 @@ pub enum VaultError {
     #[error("cancelled")]
     Cancelled,
     /// A custom PIM below `default_pim` needs a password of at least
-    /// `min_len` characters (VeraCrypt's rule; Argon2id only for now).
+    /// `min_len` characters (VeraCrypt's rule: `default_pim` is 485 for
+    /// PBKDF2 hashes and 12 for Argon2id).
     #[error("a PIM below {default_pim} needs a password of at least {min_len} characters")]
     PasswordTooShortForPim { min_len: u32, default_pim: u32 },
 }
