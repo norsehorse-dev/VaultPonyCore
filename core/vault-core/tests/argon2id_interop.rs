@@ -23,27 +23,44 @@ fn veracrypt() -> String {
     std::env::var("VERACRYPT").unwrap_or_else(|_| "veracrypt".into())
 }
 
-/// Panics unless a VeraCrypt console that knows Argon2id is available.
+/// Panics unless a VeraCrypt console that knows Argon2id is available,
+/// saying what was found instead.
 fn require_vc_with_argon2() {
-    assert!(
-        have_vc_with_argon2(),
-        "VeraCrypt 1.26.29+ console not found at `{}`; set VERACRYPT to its path",
-        veracrypt()
-    );
+    if let Err(why) = vc_version_check() {
+        panic!(
+            "VeraCrypt 1.26.29+ console not usable at `{}`: {why}. Set VERACRYPT to its path",
+            veracrypt()
+        );
+    }
 }
 
-fn have_vc_with_argon2() -> bool {
-    Command::new(veracrypt())
+/// `veracrypt --text --version`, read from stdout and stderr (the macOS
+/// build and the Linux build differ), looking for "VeraCrypt X.Y.Z"
+/// anywhere in the output.
+fn vc_version_check() -> Result<(), String> {
+    let out = Command::new(veracrypt())
         .args(["--text", "--version"])
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|v| v.trim().strip_prefix("VeraCrypt ").map(str::to_string))
-        .and_then(|v| {
-            let parts: Vec<u32> = v.split('.').filter_map(|p| p.parse().ok()).collect();
-            (parts.len() == 3).then(|| (parts[0], parts[1], parts[2]) >= (1, 26, 29))
-        })
-        .unwrap_or(false)
+        .map_err(|e| format!("could not run it ({e})"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let version = words
+        .windows(2)
+        .find(|w| w[0] == "VeraCrypt" && w[1].chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|w| w[1])
+        .ok_or_else(|| format!("no version in its output: {:?}", text.trim()))?;
+    let parts: Vec<u32> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|p| p.parse().ok())
+        .collect();
+    match parts[..] {
+        [a, b, c, ..] if (a, b, c) >= (1, 26, 29) => Ok(()),
+        _ => Err(format!("found version {version}, need 1.26.29 or later")),
+    }
 }
 
 fn prf(name: &str) -> &'static vc_types::Prf {
