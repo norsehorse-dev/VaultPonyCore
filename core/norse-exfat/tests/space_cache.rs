@@ -44,7 +44,11 @@ impl WriteAt for MemDev {
 /// Run `fsck.exfat -n` over the image when exfatprogs is installed (skipped
 /// otherwise, like the other reference-tool checks in this crate).
 fn fsck_clean(disk: &MemDev, tag: &str) {
-    if std::process::Command::new("fsck.exfat").arg("-V").output().is_err() {
+    if std::process::Command::new("fsck.exfat")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
         return;
     }
     let p = std::env::temp_dir().join(format!("vp-space-{tag}-{}.img", std::process::id()));
@@ -192,6 +196,12 @@ fn stray_end_markers_are_healed_on_the_next_create() {
         "hidden behind the marker"
     );
 
+    // Re-creating a file the bug hid must find the original, not add a
+    // second entry set with the same name.
+    assert!(
+        broken.create_file("/d/f40.bin").is_err(),
+        "f40 already exists once healed"
+    );
     broken.create_file("/d/new.bin").unwrap();
     let mut healed = ExfatFs::open(disk.clone()).unwrap();
     for i in (0..60).filter(|&i| i != 20) {
@@ -204,4 +214,36 @@ fn stray_end_markers_are_healed_on_the_next_create() {
     assert!(healed.lookup("/d/new.bin").unwrap().is_some());
     fsck_clean(&disk, "healed");
     assert!(!matches!(healed.lookup("/d/f20.bin"), Ok(Some(_))));
+}
+
+/// Listing a damaged folder heals it too (the shells' collision checks list
+/// before they create, so they must see the hidden files).
+#[test]
+fn heal_dir_restores_hidden_files_without_a_create() {
+    let disk = MemDev(Rc::new(RefCell::new(vec![0u8; 16 << 20])));
+    let mut d = disk.clone();
+    norse_exfat::format::format(&mut d, 16 << 20, 9).unwrap();
+    let mut fs = ExfatFs::open(disk.clone()).unwrap();
+    fs.make_dir("/d").unwrap();
+    for i in 0..10 {
+        fs.create_file(&format!("/d/f{i}.bin")).unwrap();
+    }
+    let name_at = find_utf16(&disk.0.borrow(), "f3.bin");
+    let set_start = name_at - 2 - 64;
+    disk.0.borrow_mut()[set_start..set_start + 96].fill(0);
+    let mut broken = ExfatFs::open(disk.clone()).unwrap();
+    assert!(!matches!(broken.lookup("/d/f7.bin"), Ok(Some(_))));
+    broken.heal_dir("/d").unwrap();
+    let mut healed = ExfatFs::open(disk.clone()).unwrap();
+    for i in (0..10).filter(|&i| i != 3) {
+        assert!(
+            matches!(healed.lookup(&format!("/d/f{i}.bin")), Ok(Some(_))),
+            "f{i}"
+        );
+    }
+    // A healthy directory is left byte-identical.
+    let before = disk.0.borrow().clone();
+    healed.heal_dir("/d").unwrap();
+    assert!(*disk.0.borrow() == before);
+    fsck_clean(&disk, "heal-dir");
 }

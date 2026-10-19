@@ -276,6 +276,20 @@ impl<D: WriteAt> ExfatFs<D> {
         Ok(out)
     }
 
+    /// Repair the directory at `path` if an older build left end markers in
+    /// front of live entries (see `heal_stray_end_markers`). Writes nothing
+    /// to a well-formed directory, so it is cheap to call before listing.
+    pub fn heal_dir(&mut self, path: &str) -> ExfatResult<()> {
+        let dir = self.resolve_dir(path)?;
+        self.heal_dir_at(dir.first_cluster)
+    }
+
+    fn heal_dir_at(&mut self, first_cluster: u32) -> ExfatResult<()> {
+        let slots = dir_slots(&mut self.disk, &self.geo, first_cluster)?;
+        let types = self.slot_types(&slots)?;
+        self.heal_stray_end_markers(&slots, &types)
+    }
+
     /// The type byte of every slot in the directory, read a cluster at a time
     /// (one read per cluster rather than one per 32-byte slot, which matters
     /// when importing thousands of files into one folder).
@@ -409,6 +423,10 @@ impl<D: WriteAt> ExfatFs<D> {
     /// Create an entry set (file or directory) named `leaf` in `parent`.
     /// For a directory, allocates and zeroes one initial cluster.
     fn create_entry(&mut self, parent: &DirHandle, leaf: &str, is_dir: bool) -> ExfatResult<()> {
+        // Heal first so the existence check sees files the old growth bug
+        // hid; otherwise re-importing a "vanished" file would add a second
+        // entry set with the same name.
+        self.heal_dir_at(parent.first_cluster)?;
         let up = self.upcase_clone();
         if locate(&mut self.disk, &self.geo, &up, parent.first_cluster, leaf)?.is_some() {
             return Err(ExfatError::Invalid("already exists"));
@@ -431,6 +449,7 @@ impl<D: WriteAt> ExfatFs<D> {
     /// clusters, then clears the old entry (clusters are not freed).
     pub fn rename(&mut self, from: &str, to: &str) -> ExfatResult<()> {
         let (from_parent, from_leaf) = self.resolve_parent(from)?;
+        self.heal_dir_at(from_parent.first_cluster)?;
         let up = self.upcase_clone();
         let src = locate(
             &mut self.disk,
@@ -441,6 +460,7 @@ impl<D: WriteAt> ExfatFs<D> {
         )?
         .ok_or(ExfatError::NotFound)?;
         let (to_parent, to_leaf) = self.resolve_parent(to)?;
+        self.heal_dir_at(to_parent.first_cluster)?;
         if locate(
             &mut self.disk,
             &self.geo,

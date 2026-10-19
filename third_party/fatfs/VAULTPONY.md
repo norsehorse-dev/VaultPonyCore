@@ -17,7 +17,9 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    rather than trusting the FSInfo hint. FSInfo's free count is advisory and
    can be stale on volumes another OS left dirty; VaultPony shows free space
    and pre-flights imports against it, so it counts once per session and
-   relies on fatfs's own bookkeeping after that.
+   relies on fatfs's own bookkeeping after that. FSInfo is only marked dirty
+   when the recount differs from the stored hint, so viewing free space never
+   rewrites an accurate FSInfo sector.
 
 ## Removal condition
 

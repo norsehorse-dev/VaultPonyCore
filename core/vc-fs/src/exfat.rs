@@ -90,6 +90,10 @@ impl Vfs for ExfatVfs {
     }
 
     fn list(&mut self, path: &str) -> VcResult<Vec<DirEntry>> {
+        // Bring back files an older VaultPony build hid behind stray end
+        // markers. A no-op on a healthy directory; on a read-only session the
+        // repair write fails and the listing simply stays as it was.
+        let _ = self.fs.heal_dir(path);
         let dir = match self.resolve(path)? {
             None => self.fs.root_dir(),
             Some(e) if e.is_dir => (e.first_cluster, e.no_fat_chain, e.size),
