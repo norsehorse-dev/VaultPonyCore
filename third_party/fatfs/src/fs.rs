@@ -531,6 +531,15 @@ impl<T: ReadWriteSeek> FileSystem<T> {
         Ok(FileSystemStats { cluster_size: self.cluster_size(), total_clusters: self.total_clusters, free_clusters })
     }
 
+    /// Returns filesystem statistics with the free cluster count recounted
+    /// from the FAT instead of trusted from FSInfo. The recount replaces the
+    /// FSInfo value, so later `stats()` calls stay exact as clusters are
+    /// allocated and freed. (VaultPony local change, see VAULTPONY.md.)
+    pub fn stats_recounted(&self) -> io::Result<FileSystemStats> {
+        let free_clusters = self.recalc_free_clusters()?;
+        Ok(FileSystemStats { cluster_size: self.cluster_size(), total_clusters: self.total_clusters, free_clusters })
+    }
+
     /// Forces free clusters recalculation.
     fn recalc_free_clusters(&self) -> io::Result<u32> {
         let mut fat = self.fat_slice();

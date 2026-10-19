@@ -1,7 +1,7 @@
 //! exFAT adapter over norse-exfat (doc §7). Read (P2) and write (P5) —
 //! create/write/mkdir/rename/unlink/truncate — behind the Vfs trait.
 
-use crate::{DirEntry, FsKind, Vfs};
+use crate::{DirEntry, FsKind, FsSpace, Vfs};
 use norse_exfat::{Entry, ExfatFs};
 use vc_types::{VcError, VcResult};
 
@@ -144,5 +144,14 @@ impl Vfs for ExfatVfs {
 
     fn flush(&mut self) -> VcResult<()> {
         Ok(())
+    }
+
+    fn space(&mut self) -> VcResult<FsSpace> {
+        let s = self.fs.space().map_err(fs_err)?;
+        Ok(FsSpace {
+            total_bytes: s.total_bytes,
+            free_bytes: s.free_bytes,
+            cluster_bytes: s.cluster_bytes,
+        })
     }
 }

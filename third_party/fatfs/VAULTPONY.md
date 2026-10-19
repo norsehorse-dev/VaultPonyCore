@@ -12,6 +12,13 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    treats as directory corruption. Upstream fixed this on master
    (unreleased as of vendoring); our patch mirrors that fix's behavior.
 
+2. `src/fs.rs`: new public `FileSystem::stats_recounted()`, which recounts
+   free clusters from the FAT (the existing private `recalc_free_clusters`)
+   rather than trusting the FSInfo hint. FSInfo's free count is advisory and
+   can be stale on volumes another OS left dirty; VaultPony shows free space
+   and pre-flights imports against it, so it counts once per session and
+   relies on fatfs's own bookkeeping after that.
+
 ## Removal condition
 
 Delete this directory and the `[patch.crates-io]` entry when a fatfs

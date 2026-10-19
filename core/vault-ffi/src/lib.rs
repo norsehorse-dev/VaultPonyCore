@@ -457,6 +457,23 @@ pub struct VolumeFacts {
     pub prf: String,
     pub filesystem: String,
     pub writable: bool,
+    /// The hidden volume is what's open (the user typed its password).
+    pub hidden: bool,
+    /// Outer volume with hidden-volume write protection (both passwords).
+    pub outer_protected: bool,
+    /// Per-file size limit of the filesystem, if it has one (FAT: 4 GiB - 1).
+    pub max_file_bytes: Option<u64>,
+}
+
+/// Total and free space of an unlocked volume. Separate from `VolumeFacts`
+/// because the first call on a session counts free clusters, and the shells
+/// refresh it after writes.
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeSpace {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Allocation unit; every file takes a whole number of these.
+    pub cluster_bytes: u64,
 }
 
 /// Unlock progress: candidate `step` of `total`, currently trying `prf`.
@@ -571,12 +588,30 @@ impl VaultSession {
     pub fn facts(&self) -> FfiResult<VolumeFacts> {
         with_session(&self.inner, |s| {
             let (scheme, prf) = (s.scheme().to_string(), s.prf().to_string());
+            let (hidden, outer_protected) = (s.is_hidden(), s.is_outer_protected());
+            let max_file_bytes = s.max_file_bytes();
             let vfs = s.vfs();
             Ok(VolumeFacts {
                 scheme,
                 prf,
                 filesystem: format!("{:?}", vfs.kind()),
                 writable: vfs.writable(),
+                hidden,
+                outer_protected,
+                max_file_bytes,
+            })
+        })
+    }
+
+    /// Total and free space. Fails for filesystems that can't report it
+    /// (NTFS, read-only); the shells then hide the figure.
+    pub fn space(&self) -> FfiResult<VolumeSpace> {
+        with_session(&self.inner, |s| {
+            let sp = s.space()?;
+            Ok(VolumeSpace {
+                total_bytes: sp.total_bytes,
+                free_bytes: sp.free_bytes,
+                cluster_bytes: sp.cluster_bytes,
             })
         })
     }
@@ -778,6 +813,14 @@ mod tests {
                     .unwrap();
             // Fresh FAT root lists without error.
             s.list("/".into()).unwrap();
+            // The facts say which volume opened; only the hidden password
+            // marks a session hidden.
+            let facts = s.facts().unwrap();
+            assert_eq!(facts.hidden, pw == "hidden-ffi");
+            assert!(!facts.outer_protected);
+            assert_eq!(facts.max_file_bytes, None, "exFAT has no 4 GiB cap");
+            let space = s.space().unwrap();
+            assert!(space.total_bytes > 0 && space.free_bytes <= space.total_bytes);
             s.lock();
         }
         let _ = std::fs::remove_file(&tmp);
@@ -828,7 +871,11 @@ mod tests {
         s.list("/".into()).unwrap();
         // The mount is writable (protection guards writes into the hidden
         // region; ordinary outer writes still go through).
-        assert!(s.facts().unwrap().writable);
+        let facts = s.facts().unwrap();
+        assert!(facts.writable);
+        assert!(facts.outer_protected);
+        assert!(!facts.hidden);
+        assert_eq!(facts.max_file_bytes, Some(u32::MAX as u64));
         s.lock();
 
         // Wrong hidden password → same coarse error as any failed unlock.
@@ -1078,6 +1125,90 @@ mod tests {
             Err(VaultError::NotFoundOrWrongPassword) => {}
             Err(other) => panic!("wrong error: {other}"),
             Ok(_) => panic!("wrong password unlocked"),
+        }
+    }
+
+    /// Free space drops by exactly the clusters a write takes, survives a
+    /// lock and re-unlock (FAT recounts, exFAT reloads its bitmap), and comes
+    /// back when the file is removed. Both filesystems VaultPony creates.
+    #[test]
+    fn space_tracks_writes_and_survives_reopen() {
+        for fs in ["FAT", "exFAT"] {
+            let tmp = std::env::temp_dir().join(format!("vaultpony-ffi-space-{fs}.vc"));
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&tmp)
+                .unwrap();
+            create_container(
+                f.into_raw_fd(),
+                8 << 20,
+                "space-pw".into(),
+                0,
+                Vec::new(),
+                "AES".into(),
+                "SHA-512".into(),
+                fs.into(),
+            )
+            .unwrap();
+            let open = || {
+                let fd = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&tmp)
+                    .unwrap()
+                    .into_raw_fd();
+                VaultSession::unlock_fd(
+                    fd,
+                    "space-pw".into(),
+                    0,
+                    Vec::new(),
+                    KdfFilter::Auto,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+
+            let s = open();
+            let before = s.space().unwrap();
+            assert!(before.cluster_bytes > 0, "{fs}");
+            assert!(
+                before.free_bytes > 0 && before.free_bytes <= before.total_bytes,
+                "{fs}"
+            );
+
+            let len: u64 = 300 * 1024 + 17;
+            s.create("/blob.bin".into()).unwrap();
+            s.write_at("/blob.bin".into(), 0, vec![0xA5; len as usize])
+                .unwrap();
+            s.flush().unwrap();
+            let after = s.space().unwrap();
+            let on_disk = len.div_ceil(before.cluster_bytes) * before.cluster_bytes;
+            assert_eq!(before.free_bytes - after.free_bytes, on_disk, "{fs}: write");
+            s.lock();
+
+            let s = open();
+            assert_eq!(s.space().unwrap(), after, "{fs}: reopen");
+            s.remove("/blob.bin".into()).unwrap();
+            s.flush().unwrap();
+            assert_eq!(
+                s.space().unwrap().free_bytes,
+                before.free_bytes,
+                "{fs}: remove"
+            );
+            s.lock();
+
+            let s = open();
+            assert_eq!(
+                s.space().unwrap().free_bytes,
+                before.free_bytes,
+                "{fs}: reopen after remove"
+            );
+            s.lock();
+            let _ = std::fs::remove_file(&tmp);
         }
     }
 }

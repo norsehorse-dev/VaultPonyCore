@@ -112,6 +112,15 @@ pub struct ExfatFs<D: ReadAt> {
     pub(crate) geo: boot::Geometry,
     upcase: upcase::UpcaseTable,
     pub(crate) bitmap: Option<BitmapLoc>,
+    pub(crate) bm_cache: alloc::BitmapCache,
+}
+
+/// Size and free space of the cluster heap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Space {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub cluster_bytes: u64,
 }
 
 impl<D: ReadAt> ExfatFs<D> {
@@ -123,12 +132,33 @@ impl<D: ReadAt> ExfatFs<D> {
             geo,
             upcase: upcase::UpcaseTable::identity(),
             bitmap: None,
+            bm_cache: alloc::BitmapCache::default(),
         };
         if let Some((first_cluster, data_len)) = fs.find_upcase_entry()? {
             fs.upcase = upcase::UpcaseTable::load(&mut fs.disk, &fs.geo, first_cluster, data_len)?;
         }
         fs.bitmap = fs.find_bitmap_entry()?;
         Ok(fs)
+    }
+
+    /// Total and free space of the cluster heap, from the allocation bitmap.
+    /// The first call loads the bitmap into memory (where it then also
+    /// speeds up allocation); later calls are a lookup.
+    pub fn space(&mut self) -> ExfatResult<Space> {
+        let bm = self
+            .bitmap
+            .ok_or(ExfatError::Invalid("no allocation bitmap"))?;
+        let free = if self.bm_cache.load(&mut self.disk, &self.geo, &bm)? {
+            self.bm_cache.free().unwrap_or(0)
+        } else {
+            alloc::count_free_on_disk(&mut self.disk, &self.geo, &bm)?
+        };
+        let cb = self.geo.cluster_bytes();
+        Ok(Space {
+            total_bytes: self.geo.cluster_count as u64 * cb,
+            free_bytes: free as u64 * cb,
+            cluster_bytes: cb,
+        })
     }
 
     fn find_bitmap_entry(&mut self) -> ExfatResult<Option<BitmapLoc>> {

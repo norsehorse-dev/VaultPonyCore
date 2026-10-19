@@ -111,6 +111,10 @@ pub struct Session {
     vfs: Box<dyn Vfs>,
     scheme: &'static str,
     prf: &'static str,
+    /// The header that opened this session sits in a hidden-volume slot.
+    hidden: bool,
+    /// Outer volume opened with hidden-volume write protection.
+    outer_protected: bool,
 }
 
 impl Session {
@@ -171,12 +175,15 @@ impl Session {
         // `found.header` (incl. master keys) is zeroized on drop here; from
         // this point the only key material lives inside the XTS engine.
         let geometry = found.header.geometry;
+        let hidden = found.header.position.is_hidden();
         let decrypted = DecryptedDevice::new(dev, xts, &geometry);
         let vfs = vc_fs::open_volume(Box::new(decrypted))?;
         Ok(Self {
             vfs,
             scheme: found.scheme.name,
             prf: found.prf.name,
+            hidden,
+            outer_protected: false,
         })
     }
 
@@ -287,6 +294,8 @@ impl Session {
             vfs,
             scheme: outer.scheme.name,
             prf: outer.prf.name,
+            hidden: false,
+            outer_protected: true,
         })
     }
 
@@ -300,6 +309,29 @@ impl Session {
 
     pub fn prf(&self) -> &'static str {
         self.prf
+    }
+
+    /// Whether this session is the hidden volume. Only ever true when the
+    /// user typed the hidden password, so the shells may label it; a plain
+    /// outer unlock reports false and shows nothing (doc §9).
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Whether this is the outer volume with hidden-volume protection on
+    /// (both passwords given).
+    pub fn is_outer_protected(&self) -> bool {
+        self.outer_protected
+    }
+
+    /// Total and free space of the open filesystem.
+    pub fn space(&mut self) -> VcResult<vc_fs::FsSpace> {
+        self.vfs.space()
+    }
+
+    /// The filesystem's per-file size limit, if any (FAT: 4 GiB - 1).
+    pub fn max_file_bytes(&self) -> Option<u64> {
+        self.vfs.max_file_bytes()
     }
 
     /// Drop the VFS and the XTS engine. There is only one lock path; the

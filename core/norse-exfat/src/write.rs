@@ -69,6 +69,16 @@ fn dir_slots<D: WriteAt>(disk: &mut D, geo: &Geometry, first: u32) -> ExfatResul
     Ok(DirSlots { chain, offsets })
 }
 
+/// Every byte of a directory, cluster by cluster in chain order.
+fn dir_bytes<D: ReadAt>(disk: &mut D, geo: &Geometry, chain: &[u32]) -> ExfatResult<Vec<u8>> {
+    let cb = geo.cluster_bytes() as usize;
+    let mut out = vec![0u8; chain.len() * cb];
+    for (n, &c) in chain.iter().enumerate() {
+        disk.read_at(geo.cluster_offset(c)?, &mut out[n * cb..(n + 1) * cb])?;
+    }
+    Ok(out)
+}
+
 fn read_slot<D: ReadAt>(disk: &mut D, off: u64) -> ExfatResult<[u8; 32]> {
     let mut raw = [0u8; 32];
     disk.read_at(off, &mut raw)?;
@@ -97,10 +107,14 @@ fn locate<D: WriteAt>(
     name: &str,
 ) -> ExfatResult<Option<EntryLoc>> {
     let slots = dir_slots(disk, geo, dir_first)?;
+    // Read the directory a cluster at a time, then parse from memory: one
+    // read per cluster instead of one per slot.
+    let bytes = dir_bytes(disk, geo, &slots.chain)?;
+    let slot = |i: usize| -> [u8; 32] { bytes[i * 32..i * 32 + 32].try_into().unwrap() };
     let want: Vec<u16> = utf16_name(name).iter().map(|&u| upcase.map(u)).collect();
     let mut i = 0;
     while i < slots.offsets.len() {
-        let raw = read_slot(disk, slots.offsets[i])?;
+        let raw = slot(i);
         if raw[0] == dir::ENTRY_END {
             break;
         }
@@ -113,7 +127,7 @@ fn locate<D: WriteAt>(
             break;
         }
         let set_offs: Vec<u64> = slots.offsets[i..=i + secondary].to_vec();
-        let stream = read_slot(disk, set_offs[1])?;
+        let stream = slot(i + 1);
         let attrs = u16::from_le_bytes([raw[4], raw[5]]);
         let name_len = stream[3] as usize;
         let flags = stream[1];
@@ -121,8 +135,8 @@ fn locate<D: WriteAt>(
         let data_len = u64::from_le_bytes(stream[24..32].try_into().unwrap());
 
         let mut units = Vec::with_capacity(name_len);
-        for &name_off in &set_offs[2..] {
-            let ne = read_slot(disk, name_off)?;
+        for k in i + 2..=i + secondary {
+            let ne = slot(k);
             if ne[0] != dir::ENTRY_NAME {
                 break;
             }
@@ -207,33 +221,45 @@ impl<D: WriteAt> ExfatFs<D> {
         Ok(())
     }
 
-    /// Find `k` consecutive usable slots within a single cluster of `dir`,
-    /// growing the directory by a cluster if none exist. Returns their disk
-    /// offsets. Growth updates a subdirectory's own size entry.
+    /// Find `k` consecutive usable slots in `dir`, growing the directory by a
+    /// cluster if none exist. Returns their disk offsets. Growth updates a
+    /// subdirectory's own size entry.
+    ///
+    /// A set may span a cluster boundary (spec §6.2: entry sets are
+    /// contiguous in the directory's slot sequence, not within a cluster).
+    /// That matters at growth time: the end-of-directory markers left at the
+    /// tail of the old last cluster must be the start of the new set, never
+    /// left sitting in front of it, because every reader (ours included)
+    /// stops at the first end marker. Before this rule, a directory that grew
+    /// put new sets after those markers, and the files were invisible.
     fn find_or_make_slot_run(&mut self, dir: &DirHandle, k: usize) -> ExfatResult<Vec<u64>> {
         let slots = dir_slots(&mut self.disk, &self.geo, dir.first_cluster)?;
-        let per = (self.geo.cluster_bytes() / 32) as usize;
-        // Scan each cluster for a run of k usable slots.
-        for ci in 0..slots.chain.len() {
-            let start = ci * per;
-            let mut run_start: Option<usize> = None;
-            for s in start..start + per {
-                let raw = read_slot(&mut self.disk, slots.offsets[s])?;
-                let usable = raw[0] == dir::ENTRY_END || raw[0] & 0x80 == 0;
-                if usable {
-                    let rs = *run_start.get_or_insert(s);
-                    if s - rs + 1 >= k {
-                        return Ok(slots.offsets[rs..rs + k].to_vec());
-                    }
-                } else {
-                    run_start = None;
+        let types = self.slot_types(&slots)?;
+        self.heal_stray_end_markers(&slots, &types)?;
+        let mut run_start: Option<usize> = None;
+        for (s, &t) in types.iter().enumerate() {
+            // A healed end marker reads back as 0x05; both are usable.
+            let usable = t == dir::ENTRY_END || t & 0x80 == 0;
+            if usable {
+                let rs = *run_start.get_or_insert(s);
+                if s - rs + 1 >= k {
+                    return Ok(slots.offsets[rs..rs + k].to_vec());
                 }
+            } else {
+                run_start = None;
             }
         }
+        // `run_start` is now the start of the usable run ending at the last
+        // slot (if any); it continues into the new cluster.
+        let tail_slots: Vec<u64> = match run_start {
+            Some(rs) => slots.offsets[rs..].to_vec(),
+            None => Vec::new(),
+        };
         // No room: grow by one cluster (k always fits in a fresh cluster).
         let bm = self.bitmap()?;
         let tail = *slots.chain.last().unwrap();
-        let added = alloc::extend_chain(&mut self.disk, &self.geo, &bm, tail, 1)?;
+        let added =
+            alloc::extend_chain(&mut self.disk, &self.geo, &bm, &mut self.bm_cache, tail, 1)?;
         let new_cluster = added[0];
         self.zero_cluster(new_cluster)?;
         self.disk.flush()?;
@@ -244,7 +270,51 @@ impl<D: WriteAt> ExfatFs<D> {
             self.disk.flush()?;
         }
         let base = self.geo.cluster_offset(new_cluster)?;
-        Ok((0..k).map(|s| base + (s * 32) as u64).collect())
+        let mut out = tail_slots;
+        let need = k - out.len();
+        out.extend((0..need).map(|s| base + (s * 32) as u64));
+        Ok(out)
+    }
+
+    /// The type byte of every slot in the directory, read a cluster at a time
+    /// (one read per cluster rather than one per 32-byte slot, which matters
+    /// when importing thousands of files into one folder).
+    fn slot_types(&mut self, slots: &DirSlots) -> ExfatResult<Vec<u8>> {
+        let bytes = dir_bytes(&mut self.disk, &self.geo, &slots.chain)?;
+        Ok(bytes.chunks_exact(32).map(|e| e[0]).collect())
+    }
+
+    /// Repair the layout older builds could leave behind: end-of-directory
+    /// markers with in-use entries after them (see `find_or_make_slot_run`).
+    /// Every end marker that sits before the last in-use entry is rewritten as
+    /// an ordinary unused entry (type 0x05, InUse clear), which readers skip,
+    /// so the sets behind it become visible again. A well-formed directory is
+    /// left untouched.
+    fn heal_stray_end_markers(&mut self, slots: &DirSlots, types: &[u8]) -> ExfatResult<()> {
+        let mut last_in_use: Option<usize> = None;
+        let mut first_end: Option<usize> = None;
+        for (i, &t) in types.iter().enumerate() {
+            if t == dir::ENTRY_END {
+                first_end.get_or_insert(i);
+            } else if t & 0x80 != 0 {
+                last_in_use = Some(i);
+            }
+        }
+        let (Some(end), Some(last)) = (first_end, last_in_use) else {
+            return Ok(());
+        };
+        if end > last {
+            return Ok(());
+        }
+        let mut unused = [0u8; 32];
+        unused[0] = 0x05;
+        for (&t, &off) in types[end..last].iter().zip(&slots.offsets[end..last]) {
+            if t == dir::ENTRY_END {
+                self.disk.write_at(off, &unused)?;
+            }
+        }
+        self.disk.flush()?;
+        Ok(())
     }
 
     /// Rewrite a set's Stream entry (cluster/size/flags) and its File
@@ -347,7 +417,7 @@ impl<D: WriteAt> ExfatFs<D> {
         // Flags: bit0 AllocationPossible; bit1 NoFatChain stays 0.
         let (first_cluster, data_len, flags) = if is_dir {
             let bm = self.bitmap()?;
-            let chain = alloc::alloc_chain(&mut self.disk, &self.geo, &bm, 1)?;
+            let chain = alloc::alloc_chain(&mut self.disk, &self.geo, &bm, &mut self.bm_cache, 1)?;
             self.zero_cluster(chain[0])?;
             self.disk.flush()?;
             (chain[0], self.geo.cluster_bytes(), 0x01)
@@ -441,11 +511,19 @@ impl<D: WriteAt> ExfatFs<D> {
         if new_clusters > old_clusters {
             let need = (new_clusters - old_clusters) as u32;
             let added = if chain.is_empty() {
-                let c = alloc::alloc_chain(&mut self.disk, &self.geo, &bm, need)?;
+                let c =
+                    alloc::alloc_chain(&mut self.disk, &self.geo, &bm, &mut self.bm_cache, need)?;
                 first = c[0];
                 c
             } else {
-                alloc::extend_chain(&mut self.disk, &self.geo, &bm, *chain.last().unwrap(), need)?
+                alloc::extend_chain(
+                    &mut self.disk,
+                    &self.geo,
+                    &bm,
+                    &mut self.bm_cache,
+                    *chain.last().unwrap(),
+                    need,
+                )?
             };
             chain.extend_from_slice(&added);
         }
@@ -533,6 +611,7 @@ impl<D: WriteAt> ExfatFs<D> {
                     &mut self.disk,
                     &self.geo,
                     &bm,
+                    &mut self.bm_cache,
                     entry.first_cluster,
                     Some(old),
                 )?;
@@ -547,7 +626,14 @@ impl<D: WriteAt> ExfatFs<D> {
                 )?;
                 for &c in &chain[keep as usize..] {
                     // free suffix cluster by cluster
-                    alloc::free_chain(&mut self.disk, &self.geo, &bm, c, Some(1))?;
+                    alloc::free_chain(
+                        &mut self.disk,
+                        &self.geo,
+                        &bm,
+                        &mut self.bm_cache,
+                        c,
+                        Some(1),
+                    )?;
                 }
                 self.rewrite_stream(&entry, entry.first_cluster, len, len, 0x01)?;
             }
@@ -585,7 +671,14 @@ impl<D: WriteAt> ExfatFs<D> {
         // Free the data clusters.
         if entry.first_cluster >= 2 {
             let bm = self.bitmap()?;
-            alloc::free_chain(&mut self.disk, &self.geo, &bm, entry.first_cluster, None)?;
+            alloc::free_chain(
+                &mut self.disk,
+                &self.geo,
+                &bm,
+                &mut self.bm_cache,
+                entry.first_cluster,
+                None,
+            )?;
             self.disk.flush()?;
         }
         Ok(())

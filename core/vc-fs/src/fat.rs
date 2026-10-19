@@ -2,12 +2,15 @@
 //! Read side for P0; write ops land with P4 behind the same trait.
 
 use crate::io::DeviceIo;
-use crate::{DirEntry, FsKind, Vfs};
+use crate::{DirEntry, FsKind, FsSpace, Vfs, FAT_MAX_FILE_BYTES};
 use std::io::{Read, Seek, SeekFrom, Write};
 use vc_types::{VcError, VcResult};
 
 pub struct FatVfs {
     fs: fatfs::FileSystem<DeviceIo>,
+    /// Set once the free count has been recounted from the FAT this session;
+    /// after that fatfs keeps it exact on every allocate and free.
+    free_counted: bool,
 }
 
 // SAFETY: `fatfs::FileSystem` fails auto-Send only because `FsOptions`
@@ -24,7 +27,10 @@ impl FatVfs {
     pub fn open(dev: DeviceIo) -> VcResult<Self> {
         let fs = fatfs::FileSystem::new(dev, fatfs::FsOptions::new())
             .map_err(|e| VcError::Filesystem(format!("FAT mount: {e}")))?;
-        Ok(Self { fs })
+        Ok(Self {
+            fs,
+            free_counted: false,
+        })
     }
 }
 
@@ -207,6 +213,29 @@ impl Vfs for FatVfs {
         f.seek(SeekFrom::Start(len)).map_err(fs_err)?;
         f.truncate().map_err(fs_err)?;
         f.flush().map_err(fs_err)
+    }
+
+    fn space(&mut self) -> VcResult<FsSpace> {
+        // FSInfo's free count is only a hint (another OS may have left it
+        // stale), so count from the FAT the first time and trust fatfs's own
+        // bookkeeping after that.
+        let stats = if self.free_counted {
+            self.fs.stats()
+        } else {
+            self.fs.stats_recounted()
+        }
+        .map_err(fs_err)?;
+        self.free_counted = true;
+        let cluster = stats.cluster_size() as u64;
+        Ok(FsSpace {
+            total_bytes: stats.total_clusters() as u64 * cluster,
+            free_bytes: stats.free_clusters() as u64 * cluster,
+            cluster_bytes: cluster,
+        })
+    }
+
+    fn max_file_bytes(&self) -> Option<u64> {
+        Some(FAT_MAX_FILE_BYTES)
     }
 
     fn flush(&mut self) -> VcResult<()> {

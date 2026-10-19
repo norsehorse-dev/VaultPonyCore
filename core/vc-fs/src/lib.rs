@@ -33,6 +33,31 @@ pub struct DirEntry {
     pub mtime_ms: Option<i64>,
 }
 
+/// Size and free space of a mounted filesystem, in bytes of file data the
+/// volume can hold (cluster heap only; boot sectors, FATs, and the exFAT
+/// bitmap are not counted as either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsSpace {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    /// Allocation unit. A file occupies whole clusters, so pre-flight checks
+    /// round each file up to this.
+    pub cluster_bytes: u64,
+}
+
+impl FsSpace {
+    /// Bytes `len` bytes of file content actually take on disk.
+    pub fn on_disk(&self, len: u64) -> u64 {
+        if self.cluster_bytes == 0 {
+            return len;
+        }
+        len.div_ceil(self.cluster_bytes) * self.cluster_bytes
+    }
+}
+
+/// FAT's per-file ceiling: the directory entry's size field is 32 bits.
+pub const FAT_MAX_FILE_BYTES: u64 = u32::MAX as u64;
+
 /// The VFS every shell talks to (§5): list/stat/open/read/write/rename/
 /// mkdir/unlink/truncate/flush. Paths are `/`-separated, relative to the
 /// volume root, and always UTF-8 (adapters handle FS-native encodings).
@@ -54,6 +79,20 @@ pub trait Vfs: Send {
     fn unlink(&mut self, path: &str) -> VcResult<()>;
     fn truncate(&mut self, path: &str, len: u64) -> VcResult<()>;
     fn flush(&mut self) -> VcResult<()>;
+
+    /// Total and free space. Adapters that can't say (NTFS, read-only)
+    /// keep the default refusal and the shells hide the figure.
+    fn space(&mut self) -> VcResult<FsSpace> {
+        Err(VcError::Filesystem(
+            "free space is not available for this filesystem".into(),
+        ))
+    }
+
+    /// Largest single file the filesystem can hold, if it has a limit
+    /// below anything a container could reach (FAT: 4 GiB - 1).
+    fn max_file_bytes(&self) -> Option<u64> {
+        None
+    }
 }
 
 /// Format a fresh FAT filesystem across a decrypted device (new-container

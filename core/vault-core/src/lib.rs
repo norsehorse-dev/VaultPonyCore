@@ -12,6 +12,7 @@ pub use session::{
     create_container, create_container_with_hidden, ContainerFs, Session, SessionId,
 };
 pub use vc_format::{CreateParams, UnlockSecret};
+pub use vc_fs::FsSpace;
 pub use vc_types::KdfFilter;
 
 use vc_types::VcResult;
