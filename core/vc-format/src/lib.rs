@@ -170,7 +170,7 @@ pub fn find_header_at(
 
     let prfs: Vec<&'static vc_types::Prf> = vc_types::registry::PRFS
         .iter()
-        .filter(|p| secret.kdf.allows(p.kdf))
+        .filter(|p| secret.kdf.allows(p))
         .collect();
     let total = slots.len() * prfs.len();
 

@@ -38,6 +38,56 @@ pub fn encryption_schemes() -> Vec<String> {
         .collect()
 }
 
+/// The name VeraCrypt shows for a scheme ("AES-Twofish-Serpent" for
+/// "AES(Twofish(Serpent))"). Shells show this everywhere a user sees a
+/// scheme; the registry name stays what `create_container` takes and what
+/// `VolumeFacts.scheme` reports. Unknown names come back unchanged.
+#[uniffi::export]
+pub fn scheme_display_name(name: String) -> String {
+    vc_types::registry::scheme_by_name(&name)
+        .map(|s| s.display_name())
+        .unwrap_or(name)
+}
+
+/// The unlock "Hash" menu (2.0.0, issues #5 and #6): Auto, then each hash
+/// in VeraCrypt's PRF order. `label` is the hash's name for the menu.
+#[derive(uniffi::Record)]
+pub struct HashChoice {
+    pub filter: KdfFilter,
+    pub label: String,
+}
+
+#[uniffi::export]
+pub fn hash_choices() -> Vec<HashChoice> {
+    let mut out = vec![HashChoice {
+        filter: KdfFilter::Auto,
+        label: "Auto".to_string(),
+    }];
+    out.extend(
+        vc_types::KdfFilter::SINGLE
+            .iter()
+            .map(|(f, name)| HashChoice {
+                filter: (*f).into(),
+                label: name.to_string(),
+            }),
+    );
+    out
+}
+
+/// The single-hash filter for a PRF name (as `VolumeFacts.prf` reports it),
+/// or None. For remembering a hash the user picked.
+#[uniffi::export]
+pub fn kdf_filter_for_prf(prf: String) -> Option<KdfFilter> {
+    vc_types::KdfFilter::for_prf(&prf).map(Into::into)
+}
+
+/// Whether an unlock under `filter` may run Argon2id, so the shell should
+/// check free memory first (`argon2_memory_mib`).
+#[uniffi::export]
+pub fn kdf_filter_may_use_argon2(filter: KdfFilter) -> bool {
+    vc_types::KdfFilter::from(filter).may_use_argon2()
+}
+
 /// Hashes (PRFs) a new container can use, in menu order — the names
 /// `create_container` / `create_hidden_container` accept for `prf`.
 #[uniffi::export]
@@ -56,13 +106,35 @@ pub fn filesystems() -> Vec<String> {
     vec!["FAT".to_string(), "exFAT".to_string()]
 }
 
-/// Which KDFs an unlock may try. `Auto` matches VeraCrypt (everything);
-/// the narrow choices skip the other family's cost entirely.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+/// Which key derivations an unlock may try. `Auto` matches VeraCrypt
+/// (everything); a single hash matches VeraCrypt's PKCS-5 PRF choice;
+/// `Pbkdf2Only` (every PBKDF2 hash) is kept for remembered Face ID and
+/// biometric unlocks from before 2.0.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, uniffi::Enum)]
 pub enum KdfFilter {
     Auto,
     Pbkdf2Only,
     Argon2idOnly,
+    Sha512,
+    Sha256,
+    Blake2s256,
+    Whirlpool,
+    Streebog,
+}
+
+impl From<vc_types::KdfFilter> for KdfFilter {
+    fn from(f: vc_types::KdfFilter) -> Self {
+        match f {
+            vc_types::KdfFilter::Auto => KdfFilter::Auto,
+            vc_types::KdfFilter::Pbkdf2Only => KdfFilter::Pbkdf2Only,
+            vc_types::KdfFilter::Argon2idOnly => KdfFilter::Argon2idOnly,
+            vc_types::KdfFilter::Sha512 => KdfFilter::Sha512,
+            vc_types::KdfFilter::Sha256 => KdfFilter::Sha256,
+            vc_types::KdfFilter::Blake2s256 => KdfFilter::Blake2s256,
+            vc_types::KdfFilter::Whirlpool => KdfFilter::Whirlpool,
+            vc_types::KdfFilter::Streebog => KdfFilter::Streebog,
+        }
+    }
 }
 
 impl From<KdfFilter> for vc_types::KdfFilter {
@@ -71,6 +143,11 @@ impl From<KdfFilter> for vc_types::KdfFilter {
             KdfFilter::Auto => vc_types::KdfFilter::Auto,
             KdfFilter::Pbkdf2Only => vc_types::KdfFilter::Pbkdf2Only,
             KdfFilter::Argon2idOnly => vc_types::KdfFilter::Argon2idOnly,
+            KdfFilter::Sha512 => vc_types::KdfFilter::Sha512,
+            KdfFilter::Sha256 => vc_types::KdfFilter::Sha256,
+            KdfFilter::Blake2s256 => vc_types::KdfFilter::Blake2s256,
+            KdfFilter::Whirlpool => vc_types::KdfFilter::Whirlpool,
+            KdfFilter::Streebog => vc_types::KdfFilter::Streebog,
         }
     }
 }

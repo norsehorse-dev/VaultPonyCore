@@ -43,6 +43,18 @@ pub struct EncryptionScheme {
 }
 
 impl EncryptionScheme {
+    /// The name VeraCrypt shows for this scheme: ciphers outermost first,
+    /// joined by "-" ("AES-Twofish-Serpent", "Camellia-Kuznyechik"). The
+    /// registry `name` ("AES(Twofish(Serpent))") stays the API identifier.
+    pub fn display_name(&self) -> String {
+        self.layers
+            .iter()
+            .rev()
+            .map(|c| c.name())
+            .collect::<Vec<_>>()
+            .join("-")
+    }
+
     /// Total master-key bytes this scheme consumes from the 256-byte area:
     /// 64 per layer (two 256-bit XTS keys).
     pub const fn key_bytes(&self) -> usize {
@@ -60,26 +72,68 @@ pub enum Kdf {
     Argon2id,
 }
 
-/// Which KDFs an unlock search may try. VeraCrypt itself always tries all
-/// of them; narrowing is a VaultPony convenience for users who know their
-/// volume, because an Argon2id-only search skips the whole PBKDF2 sweep and
-/// a PBKDF2-only search skips Argon2id's memory and time.
+/// Which header-key derivations an unlock search may try. VeraCrypt's mount
+/// dialog tries all of them under "Autodetection" and exactly one when the
+/// user picks a PKCS-5 PRF; VaultPony does the same. Narrowing only skips
+/// cost: an Argon2id-only search skips the whole PBKDF2 sweep, a single
+/// hash skips every other derivation (2.0.0, issues #5 and #6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum KdfFilter {
     #[default]
     Auto,
+    /// Every PBKDF2 hash, no Argon2id.
     Pbkdf2Only,
+    /// Argon2id only (VeraCrypt's "Argon2").
     Argon2idOnly,
+    Sha512,
+    Sha256,
+    Blake2s256,
+    Whirlpool,
+    Streebog,
 }
 
 impl KdfFilter {
-    pub const fn allows(self, kdf: Kdf) -> bool {
-        matches!(
-            (self, kdf),
-            (KdfFilter::Auto, _)
-                | (KdfFilter::Pbkdf2Only, Kdf::Pbkdf2)
-                | (KdfFilter::Argon2idOnly, Kdf::Argon2id)
-        )
+    /// The single-hash choices, in VeraCrypt's PRF list order, with the
+    /// registry name each one selects. Argon2id is listed too; it is the
+    /// same filter as `Argon2idOnly`.
+    pub const SINGLE: [(KdfFilter, &'static str); 6] = [
+        (KdfFilter::Sha512, "SHA-512"),
+        (KdfFilter::Whirlpool, "Whirlpool"),
+        (KdfFilter::Sha256, "SHA-256"),
+        (KdfFilter::Blake2s256, "BLAKE2s-256"),
+        (KdfFilter::Streebog, "Streebog"),
+        (KdfFilter::Argon2idOnly, "Argon2id"),
+    ];
+
+    /// Whether the search may derive with `prf`.
+    pub fn allows(self, prf: &Prf) -> bool {
+        match self {
+            KdfFilter::Auto => true,
+            KdfFilter::Pbkdf2Only => prf.kdf == Kdf::Pbkdf2,
+            KdfFilter::Argon2idOnly => prf.kdf == Kdf::Argon2id,
+            single => single.prf_name() == Some(prf.name),
+        }
+    }
+
+    /// The one PRF this filter selects, if it selects exactly one.
+    pub fn prf_name(self) -> Option<&'static str> {
+        Self::SINGLE
+            .iter()
+            .find(|(f, _)| *f == self)
+            .map(|(_, name)| *name)
+    }
+
+    /// The filter that selects exactly `prf_name` (a registry name).
+    pub fn for_prf(prf_name: &str) -> Option<KdfFilter> {
+        Self::SINGLE
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(prf_name))
+            .map(|(f, _)| *f)
+    }
+
+    /// Whether the search may run Argon2id (shells check free memory first).
+    pub fn may_use_argon2(self) -> bool {
+        matches!(self, KdfFilter::Auto | KdfFilter::Argon2idOnly)
     }
 }
 
@@ -241,17 +295,17 @@ mod tests {
             KdfFilter::Pbkdf2Only,
             KdfFilter::Argon2idOnly,
         ] {
-            assert!(PRFS.iter().any(|p| f.allows(p.kdf)), "{f:?}");
+            assert!(PRFS.iter().any(|p| f.allows(p)), "{f:?}");
         }
         assert_eq!(
             PRFS.iter()
-                .filter(|p| KdfFilter::Argon2idOnly.allows(p.kdf))
+                .filter(|p| KdfFilter::Argon2idOnly.allows(p))
                 .count(),
             1
         );
         assert_eq!(
             PRFS.iter()
-                .filter(|p| KdfFilter::Pbkdf2Only.allows(p.kdf))
+                .filter(|p| KdfFilter::Pbkdf2Only.allows(p))
                 .count(),
             PRFS.len() - 1
         );
@@ -335,5 +389,67 @@ mod tests {
         let sha512 = PRFS.iter().find(|p| p.name == "SHA-512").unwrap();
         assert_eq!(iterations_for_pim(sha512, 0), sha512.default_iterations);
         assert_eq!(iterations_for_pim(sha512, 485), 500_000);
+    }
+}
+
+/// Look a scheme up by its registry name ("AES(Twofish)") or its VeraCrypt
+/// display name ("AES-Twofish"), ignoring case.
+pub fn scheme_by_name(name: &str) -> Option<&'static EncryptionScheme> {
+    ENCRYPTION_SCHEMES
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case(name) || s.display_name().eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn display_names_match_veracrypt() {
+        let want = [
+            ("AES", "AES"),
+            ("Serpent", "Serpent"),
+            ("Twofish", "Twofish"),
+            ("Camellia", "Camellia"),
+            ("Kuznyechik", "Kuznyechik"),
+            ("AES(Twofish)", "AES-Twofish"),
+            ("AES(Twofish(Serpent))", "AES-Twofish-Serpent"),
+            ("Serpent(AES)", "Serpent-AES"),
+            ("Serpent(Twofish(AES))", "Serpent-Twofish-AES"),
+            ("Twofish(Serpent)", "Twofish-Serpent"),
+            ("Camellia(Kuznyechik)", "Camellia-Kuznyechik"),
+            ("Kuznyechik(Twofish)", "Kuznyechik-Twofish"),
+            ("Camellia(Serpent)", "Camellia-Serpent"),
+            ("Kuznyechik(AES)", "Kuznyechik-AES"),
+            (
+                "Kuznyechik(Serpent(Camellia))",
+                "Kuznyechik-Serpent-Camellia",
+            ),
+        ];
+        assert_eq!(ENCRYPTION_SCHEMES.len(), want.len());
+        for (name, display) in want {
+            let s = scheme_by_name(name).unwrap();
+            assert_eq!(s.display_name(), display);
+            assert_eq!(scheme_by_name(display).unwrap().name, name);
+        }
+    }
+
+    #[test]
+    fn single_hash_filters_select_one_prf() {
+        for (filter, name) in KdfFilter::SINGLE {
+            let allowed: Vec<_> = PRFS
+                .iter()
+                .filter(|p| filter.allows(p))
+                .map(|p| p.name)
+                .collect();
+            assert_eq!(allowed, vec![name]);
+            assert_eq!(KdfFilter::for_prf(name), Some(filter));
+        }
+        assert_eq!(
+            PRFS.iter().filter(|p| KdfFilter::Auto.allows(p)).count(),
+            PRFS.len()
+        );
+        assert!(!KdfFilter::Sha256.may_use_argon2());
+        assert!(KdfFilter::Auto.may_use_argon2());
     }
 }

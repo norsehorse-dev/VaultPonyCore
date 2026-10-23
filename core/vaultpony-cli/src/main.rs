@@ -24,9 +24,9 @@ use zeroize::Zeroizing;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Which KDFs to try when opening a volume. "auto" tries all, like
-    /// VeraCrypt; "argon2id" skips the PBKDF2 sweep for Argon2id volumes,
-    /// "pbkdf2" skips Argon2id's memory and time for PBKDF2 volumes.
+    /// Which key derivations to try when opening a volume. "auto" tries all,
+    /// like VeraCrypt; a hash name tries only that one, like VeraCrypt's
+    /// PKCS-5 PRF choice; "pbkdf2" tries every hash except Argon2id.
     #[arg(long, global = true, value_enum, default_value_t = KdfArg::Auto)]
     kdf: KdfArg,
 }
@@ -36,6 +36,14 @@ enum KdfArg {
     Auto,
     Pbkdf2,
     Argon2id,
+    #[value(name = "sha-512")]
+    Sha512,
+    #[value(name = "sha-256")]
+    Sha256,
+    #[value(name = "blake2s-256")]
+    Blake2s256,
+    Whirlpool,
+    Streebog,
 }
 
 static KDF: OnceLock<KdfFilter> = OnceLock::new();
@@ -58,7 +66,8 @@ enum Command {
         /// Total size in bytes.
         #[arg(long)]
         size: u64,
-        /// Encryption scheme name, e.g. "AES", "AES(Twofish)".
+        /// Encryption scheme, e.g. "AES", "AES-Twofish" (VeraCrypt's names;
+        /// "AES(Twofish)" also works).
         #[arg(long, default_value = "AES")]
         encryption: String,
         /// PRF/hash name, e.g. "SHA-512", "Whirlpool".
@@ -85,7 +94,8 @@ enum Command {
         /// Hidden volume data-area size in bytes (carved from the tail).
         #[arg(long = "hidden-size")]
         hidden_size: u64,
-        /// Encryption scheme name, e.g. "AES", "AES(Twofish)".
+        /// Encryption scheme, e.g. "AES", "AES-Twofish" (VeraCrypt's names;
+        /// "AES(Twofish)" also works).
         #[arg(long, default_value = "AES")]
         encryption: String,
         /// PRF/hash name, e.g. "SHA-512", "Whirlpool".
@@ -222,7 +232,10 @@ fn cmd_info(container: PathBuf, pim: u32, keyfiles: Vec<PathBuf>) -> ExitCode {
     }
     match result {
         Ok(info) => {
-            println!("scheme:               {}", info.scheme);
+            let scheme = vc_types::registry::scheme_by_name(info.scheme)
+                .map(|s| s.display_name())
+                .unwrap_or_else(|| info.scheme.to_string());
+            println!("scheme:               {scheme}");
             println!("prf:                  {}", info.prf);
             println!("header:               {:?}", info.source);
             println!("header version:       {}", info.header_version);
@@ -525,6 +538,11 @@ fn main() -> ExitCode {
         KdfArg::Auto => KdfFilter::Auto,
         KdfArg::Pbkdf2 => KdfFilter::Pbkdf2Only,
         KdfArg::Argon2id => KdfFilter::Argon2idOnly,
+        KdfArg::Sha512 => KdfFilter::Sha512,
+        KdfArg::Sha256 => KdfFilter::Sha256,
+        KdfArg::Blake2s256 => KdfFilter::Blake2s256,
+        KdfArg::Whirlpool => KdfFilter::Whirlpool,
+        KdfArg::Streebog => KdfFilter::Streebog,
     });
     match cli.command {
         Command::Create {
@@ -613,10 +631,7 @@ fn cmd_create_hidden(
         Ok(f) => f,
         Err(c) => return c,
     };
-    let Some(scheme) = vc_types::registry::ENCRYPTION_SCHEMES
-        .iter()
-        .find(|s| s.name == encryption)
-    else {
+    let Some(scheme) = vc_types::registry::scheme_by_name(&encryption) else {
         eprintln!("error: unknown encryption scheme {encryption:?}");
         return ExitCode::FAILURE;
     };
@@ -719,10 +734,7 @@ fn cmd_create(
         Ok(f) => f,
         Err(c) => return c,
     };
-    let Some(scheme) = vc_types::registry::ENCRYPTION_SCHEMES
-        .iter()
-        .find(|s| s.name == encryption)
-    else {
+    let Some(scheme) = vc_types::registry::scheme_by_name(&encryption) else {
         eprintln!("error: unknown encryption scheme {encryption:?}");
         return ExitCode::FAILURE;
     };

@@ -57,13 +57,12 @@ fn format_data(
     fs: ContainerFs,
 ) -> VcResult<()> {
     let secret = vc_crypto::apply_keyfiles(params.passphrase, params.keyfiles);
-    // We just wrote this header, so search only its KDF family: an Argon2id
-    // container is found on its first derivation instead of after the whole
-    // PBKDF2 sweep.
-    let kdf = match params.prf.kdf {
+    // We just wrote this header, so search only its PRF: found on the first
+    // derivation instead of after the whole sweep.
+    let kdf = vc_types::KdfFilter::for_prf(params.prf.name).unwrap_or(match params.prf.kdf {
         vc_types::Kdf::Pbkdf2 => vc_types::KdfFilter::Pbkdf2Only,
         vc_types::Kdf::Argon2id => vc_types::KdfFilter::Argon2idOnly,
-    };
+    });
     let found = find_header(
         dev.as_mut(),
         &UnlockSecret {

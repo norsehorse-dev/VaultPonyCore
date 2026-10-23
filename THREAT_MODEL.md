@@ -201,12 +201,16 @@ The UX rules hidden volumes impose hold from 1.0 (doc §11):
   drop. Running out of memory is reported as its own error, never as a
   wrong password, and is raised before any Argon2id slot is tried, so it
   says nothing about which slots exist. The optional KDF filter (Auto,
-  PBKDF2 only, Argon2id only) narrows which KDFs are tried but keeps the
-  rule: under any filter, a wrong password derives every allowed (KDF,
+  PBKDF2 only, Argon2id only, or one hash as in VeraCrypt's PKCS-5 PRF
+  menu) narrows which derivations are tried but keeps the rule: under any filter, a wrong password derives every allowed (KDF,
   slot) pair, so timing still says nothing about a hidden volume. A cancel
   is checked only between derivations and always before any write.
 - Remembered unlock parameters (PRF/scheme cache keyed by salt fingerprint)
-  contain no secrets and no evidence of hidden-slot probing. Remembering a
+  contain no secrets and no evidence of hidden-slot probing. A hash the
+  shells remember per vault (2.0.0) is only one the user picked by hand,
+  never one the search found, and nothing is remembered in no-trace mode:
+  a remembered hash found by opening a hidden volume would not match the
+  outer volume, and that mismatch would hint that a hidden one exists. Remembering a
   PIM is opt-in per container because a stored PIM is weak evidence a
   container has a non-default configuration.
 
