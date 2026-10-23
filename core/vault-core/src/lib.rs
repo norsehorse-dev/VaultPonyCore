@@ -4,9 +4,11 @@
 //! Owns every secret lifecycle: passphrases and keys live exactly as long
 //! as a session needs them and are zeroized on lock (doc §11).
 
+pub mod handoff;
 pub mod probe;
 pub mod session;
 
+pub use handoff::enable_handoff;
 pub use probe::{probe, probe_with, HeaderSource, VolumeInfo};
 pub use session::{
     create_container, create_container_with_hidden, ContainerFs, Session, SessionId,

@@ -178,6 +178,14 @@ fn power_cut_at_every_write_boundary_preserves_committed_files() {
     // -- Replay: cut after every op ----------------------------------------
     let mut image = base.clone();
     let fsck_available = Command::new("fsck.fat").arg("--help").output().is_ok();
+    // Sampling keeps the default run fast. VAULTPONY_FULL_POWERLOSS=1 runs
+    // fsck at every cut (it found the torn directory-entry write fixed in
+    // the vendored fatfs, see third_party/fatfs/VAULTPONY.md).
+    let every = if std::env::var_os("VAULTPONY_FULL_POWERLOSS").is_some() {
+        1
+    } else {
+        25
+    };
     let barrier_cuts: std::collections::HashSet<usize> = barriers.iter().map(|(k, _)| *k).collect();
 
     for k in 1..=total {
@@ -200,9 +208,9 @@ fn power_cut_at_every_write_boundary_preserves_committed_files() {
             );
         }
 
-        // Invariant 3 at barriers + every 25th cut: repairable, and still
+        // Invariant 3 at barriers + every `every`th cut: repairable, and still
         // intact after repair.
-        if fsck_available && (barrier_cuts.contains(&k) || k % 25 == 0) {
+        if fsck_available && (barrier_cuts.contains(&k) || k % every == 0) {
             let f = std::env::temp_dir().join(format!("vp-cut-{}-{k}.img", std::process::id()));
             std::fs::write(&f, &image).unwrap();
             let status = Command::new("fsck.fat")

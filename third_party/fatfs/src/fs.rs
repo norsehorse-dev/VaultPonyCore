@@ -561,6 +561,16 @@ impl<T: ReadWriteSeek> FileSystem<T> {
         self.unmount_internal()
     }
 
+    /// Writes the FSInfo sector (if changed) and clears the volume dirty flag,
+    /// leaving the filesystem mounted: what `unmount` does on disk, without
+    /// consuming it. VaultPony: lets a session publish its metadata at the end
+    /// of every logical operation, so a later remount by another process (or a
+    /// drop of this one) never writes stale FSInfo over newer state.
+    pub fn sync_metadata(&self) -> io::Result<()> {
+        self.unmount_internal()?;
+        self.disk.borrow_mut().flush()
+    }
+
     fn unmount_internal(&self) -> io::Result<()> {
         self.flush_fs_info()?;
         self.set_dirty_flag(false)?;

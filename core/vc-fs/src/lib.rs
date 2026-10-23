@@ -80,6 +80,35 @@ pub trait Vfs: Send {
     fn truncate(&mut self, path: &str, len: u64) -> VcResult<()>;
     fn flush(&mut self) -> VcResult<()>;
 
+    /// Put the file at `src` in place of `dst`, replacing `dst` if it exists.
+    /// Used to land a fully written temporary file over the original, so a
+    /// writer killed mid-copy leaves the original intact. FAT and exFAT have
+    /// no atomic rename-over, so the default removes `dst` and then renames:
+    /// a kill between the two leaves `src` complete and `dst` missing, which
+    /// the caller's recovery (rename the leftover temp file in) repairs.
+    /// Both paths must be in the same directory or the caller must accept a
+    /// move. Flushes before returning.
+    fn replace(&mut self, src: &str, dst: &str) -> VcResult<()> {
+        let src_entry = self.stat(src)?;
+        if src_entry.is_dir {
+            return Err(VcError::Filesystem("replace: source is a directory".into()));
+        }
+        match self.stat(dst) {
+            Ok(d) if d.is_dir => {
+                return Err(VcError::Filesystem(
+                    "replace: destination is a directory".into(),
+                ))
+            }
+            Ok(_) => {
+                self.unlink(dst)?;
+                self.flush()?;
+            }
+            Err(_) => {}
+        }
+        self.rename(src, dst)?;
+        self.flush()
+    }
+
     /// Total and free space. Adapters that can't say (NTFS, read-only)
     /// keep the default refusal and the shells hide the figure.
     fn space(&mut self) -> VcResult<FsSpace> {

@@ -1,18 +1,24 @@
 //! Unlocked-volume sessions (doc §5).
 //!
 //! A `Session` is one unlocked container: the decrypted device wrapped in
-//! its filesystem adapter. Master keys live inside the XTS engine only; the
+//! its filesystem adapter. Master keys live inside the XTS engine (plus one
+//! zeroizing copy when the process enabled the File Provider handoff); the
 //! parsed header (and its key material) is zeroized before `unlock`
 //! returns. The mount table, auto-lock timers, and the remembered-parameters
 //! cache arrive with the shells (P3+) — this is the core they will call.
 
+use crate::handoff::{handoff_enabled, KeyRecord};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use vc_format::{
-    find_header, find_header_at, DecryptedDevice, ProtectedDevice, UnlockProgress, UnlockSecret,
+    find_header, find_header_at, position_offset, DecryptedDevice, FoundHeader, ProtectedDevice,
+    UnlockProgress, UnlockSecret,
 };
 use vc_fs::Vfs;
-use vc_io::FileDevice;
-use vc_types::{HeaderPosition, VcError, VcResult};
+use vc_io::{BlockDevice, FileDevice};
+use vc_types::{consts, HeaderPosition, VcError, VcResult};
+use zeroize::Zeroizing;
 
 /// Which filesystem a new container is formatted with. FAT is the universal
 /// default; exFAT lifts the 4 GiB per-file limit for large-file vaults.
@@ -109,12 +115,128 @@ pub struct SessionId(pub u64);
 /// One unlocked container.
 pub struct Session {
     vfs: Box<dyn Vfs>,
+    /// The decrypted (and, for outer-protected sessions, shielded) device the
+    /// filesystem sits on. Shared with `vfs` so [`Session::remount`] can drop
+    /// the filesystem and open a fresh one over the same keys.
+    device: SharedDevice,
+    record: KeyRecord,
+    /// Hidden-volume protection latch, outer-protected sessions only.
+    latch: Option<Arc<AtomicBool>>,
     scheme: &'static str,
     prf: &'static str,
     /// The header that opened this session sits in a hidden-volume slot.
     hidden: bool,
     /// Outer volume opened with hidden-volume write protection.
     outer_protected: bool,
+}
+
+/// A block device several owners can hold: the session and its filesystem.
+#[derive(Clone)]
+struct SharedDevice(Arc<Mutex<Box<dyn BlockDevice>>>);
+
+impl SharedDevice {
+    fn new(dev: Box<dyn BlockDevice>) -> Self {
+        Self(Arc::new(Mutex::new(dev)))
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut dyn BlockDevice) -> VcResult<T>) -> VcResult<T> {
+        let mut guard = self
+            .0
+            .lock()
+            .map_err(|_| VcError::Internal("device lock poisoned".into()))?;
+        f(guard.as_mut())
+    }
+}
+
+impl BlockDevice for SharedDevice {
+    fn len(&mut self) -> VcResult<u64> {
+        self.with(|d| d.len())
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> VcResult<()> {
+        self.with(|d| d.read_at(offset, buf))
+    }
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> VcResult<()> {
+        self.with(|d| d.write_at(offset, buf))
+    }
+    fn flush(&mut self) -> VcResult<()> {
+        self.with(|d| d.flush())
+    }
+}
+
+/// Stand-in filesystem while a remount is between dropping the old one and
+/// opening the new one (and if reopening fails): every call errors.
+struct Unmounted;
+
+impl Vfs for Unmounted {
+    fn kind(&self) -> vc_fs::FsKind {
+        vc_fs::FsKind::Unknown
+    }
+    fn writable(&self) -> bool {
+        false
+    }
+    fn list(&mut self, _: &str) -> VcResult<Vec<vc_fs::DirEntry>> {
+        Err(unmounted())
+    }
+    fn stat(&mut self, _: &str) -> VcResult<vc_fs::DirEntry> {
+        Err(unmounted())
+    }
+    fn read_at(&mut self, _: &str, _: u64, _: &mut [u8]) -> VcResult<usize> {
+        Err(unmounted())
+    }
+    fn write_at(&mut self, _: &str, _: u64, _: &[u8]) -> VcResult<usize> {
+        Err(unmounted())
+    }
+    fn create(&mut self, _: &str) -> VcResult<()> {
+        Err(unmounted())
+    }
+    fn mkdir(&mut self, _: &str) -> VcResult<()> {
+        Err(unmounted())
+    }
+    fn rename(&mut self, _: &str, _: &str) -> VcResult<()> {
+        Err(unmounted())
+    }
+    fn unlink(&mut self, _: &str) -> VcResult<()> {
+        Err(unmounted())
+    }
+    fn truncate(&mut self, _: &str, _: u64) -> VcResult<()> {
+        Err(unmounted())
+    }
+    fn flush(&mut self) -> VcResult<()> {
+        Ok(())
+    }
+}
+
+fn unmounted() -> VcError {
+    VcError::Internal("filesystem not mounted".into())
+}
+
+/// Capture how a header opened, before the header (and its keys) is dropped.
+fn key_record(
+    dev: &mut dyn BlockDevice,
+    found: &FoundHeader,
+    protected: Option<(u64, u64)>,
+) -> VcResult<KeyRecord> {
+    let container_len = dev.len()?;
+    let header_offset = position_offset(found.header.position, container_len)
+        .ok_or_else(|| VcError::Internal("header position outside container".into()))?;
+    let mut salt = [0u8; consts::SALT_LEN];
+    dev.read_at(header_offset, &mut salt)?;
+    let keys = if handoff_enabled() {
+        Zeroizing::new(found.header.master_keys[..found.scheme.key_bytes()].to_vec())
+    } else {
+        Zeroizing::new(Vec::new())
+    };
+    Ok(KeyRecord {
+        keys,
+        scheme: found.scheme,
+        prf: found.prf,
+        geometry: found.header.geometry,
+        header_offset,
+        salt,
+        container_len,
+        hidden: found.header.position.is_hidden(),
+        protected,
+    })
 }
 
 impl Session {
@@ -168,23 +290,92 @@ impl Session {
         progress: &mut UnlockProgress<'_>,
     ) -> VcResult<Self> {
         let found = find_header(dev.as_mut(), secret, progress)?;
+        let record = key_record(dev.as_mut(), &found, None)?;
         let xts = vc_crypto::SchemeXts::new(
             found.scheme,
             &found.header.master_keys[..found.scheme.key_bytes()],
         )?;
         // `found.header` (incl. master keys) is zeroized on drop here; from
-        // this point the only key material lives inside the XTS engine.
+        // this point key material lives inside the XTS engine, plus the
+        // record's copy when handoff is enabled (THREAT_MODEL.md).
         let geometry = found.header.geometry;
         let hidden = found.header.position.is_hidden();
-        let decrypted = DecryptedDevice::new(dev, xts, &geometry);
-        let vfs = vc_fs::open_volume(Box::new(decrypted))?;
+        let device = SharedDevice::new(Box::new(DecryptedDevice::new(dev, xts, &geometry)));
+        let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
         Ok(Self {
             vfs,
+            device,
+            record,
+            latch: None,
             scheme: found.scheme.name,
             prf: found.prf.name,
             hidden,
             outer_protected: false,
         })
+    }
+
+    /// Open a volume in a second process from a [`Session::export_handoff`]
+    /// blob and that process's own fd to the same container. No KDF runs.
+    /// Fails with `NotFoundOrWrongPassword` if `dev` is not the container the
+    /// blob came from (length and header salt are checked).
+    pub fn import_handoff(mut dev: Box<dyn BlockDevice>, blob: &[u8]) -> VcResult<Self> {
+        let (mut record, tripped) = KeyRecord::decode(blob)?;
+        record.check_container(dev.as_mut())?;
+        let xts = vc_crypto::SchemeXts::new(record.scheme, &record.keys)?;
+        if !handoff_enabled() {
+            record.keys = Zeroizing::new(Vec::new());
+        }
+        let decrypted = DecryptedDevice::new(dev, xts, &record.geometry);
+        let (device, latch) = match record.protected {
+            Some((start, len)) => {
+                let latch = Arc::new(AtomicBool::new(tripped));
+                let protected =
+                    ProtectedDevice::with_latch(Box::new(decrypted), start, len, latch.clone());
+                (SharedDevice::new(Box::new(protected)), Some(latch))
+            }
+            None => (SharedDevice::new(Box::new(decrypted)), None),
+        };
+        let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
+        Ok(Self {
+            vfs,
+            device,
+            scheme: record.scheme.name,
+            prf: record.prf.name,
+            hidden: record.hidden,
+            outer_protected: latch.is_some(),
+            latch,
+            record,
+        })
+    }
+
+    /// Everything another process needs to open this volume without the
+    /// password: scheme, master keys, geometry, container fingerprint. Never
+    /// the password, PIM or keyfiles. Only for sessions unlocked after
+    /// [`crate::enable_handoff`]. The caller must keep the blob in memory and
+    /// wipe it after use.
+    pub fn export_handoff(&self) -> VcResult<Zeroizing<Vec<u8>>> {
+        let tripped = self
+            .latch
+            .as_ref()
+            .is_some_and(|l| l.load(Ordering::Relaxed));
+        self.record.encode(tripped)
+    }
+
+    /// Drop the filesystem and mount it again over the same decrypted device.
+    /// For when another process wrote to the volume since this session last
+    /// looked: every cached allocation state (FAT FSInfo, the exFAT bitmap
+    /// copy, the free-space count) is thrown away. Flush before another
+    /// process writes, so nothing stale is pending when this runs.
+    pub fn remount(&mut self) -> VcResult<()> {
+        let old = std::mem::replace(&mut self.vfs, Box::new(Unmounted));
+        drop(old);
+        self.vfs = vc_fs::open_volume(Box::new(self.device.clone()))?;
+        Ok(())
+    }
+
+    /// Replace `dst` with `src` (see [`Vfs::replace`]).
+    pub fn replace(&mut self, src: &str, dst: &str) -> VcResult<()> {
+        self.vfs.replace(src, dst)
     }
 
     /// Open the OUTER volume read-write with hidden-volume protection
@@ -279,19 +470,30 @@ impl Session {
             ));
         }
 
+        let record = key_record(
+            dev.as_mut(),
+            &outer,
+            Some((protected_start, hidden_geo.encrypted_area_size)),
+        )?;
         let xts = vc_crypto::SchemeXts::new(
             outer.scheme,
             &outer.header.master_keys[..outer.scheme.key_bytes()],
         )?;
         let decrypted = DecryptedDevice::new(dev, xts, &outer_geo);
-        let protected = ProtectedDevice::new(
+        let latch = Arc::new(AtomicBool::new(false));
+        let protected = ProtectedDevice::with_latch(
             Box::new(decrypted),
             protected_start,
             hidden_geo.encrypted_area_size,
+            latch.clone(),
         );
-        let vfs = vc_fs::open_volume(Box::new(protected))?;
+        let device = SharedDevice::new(Box::new(protected));
+        let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
         Ok(Self {
             vfs,
+            device,
+            record,
+            latch: Some(latch),
             scheme: outer.scheme.name,
             prf: outer.prf.name,
             hidden: false,

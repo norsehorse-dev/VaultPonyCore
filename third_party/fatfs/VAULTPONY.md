@@ -21,6 +21,22 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    when the recount differs from the stored hint, so viewing free space never
    rewrites an accurate FSInfo sector.
 
+3. `src/fs.rs`: new public `FileSystem::sync_metadata()`, which writes the
+   FSInfo sector (if changed) and clears the volume dirty flag without
+   unmounting. VaultPony calls it on every flush, so FSInfo is current at the
+   end of each logical operation. With two sessions on one volume (the iOS app
+   and its File Provider extension, 2.0.0 rc3), the one that remounts must not
+   later write a stale FSInfo over the other's.
+
+4. `src/dir_entry.rs`: directory entries (8.3 and LFN) are serialized into a
+   32-byte buffer and written with one write. Stock 0.3.6 writes each field
+   separately, so a power cut or process kill in the middle of writing an
+   entry into a deleted slot could leave the new name next to the old entry's
+   first cluster, cross-linking it with a live file (fsck.fat: "share
+   clusters", then truncates the live file). Found by running the FAT
+   power-loss harness with fsck at every cut
+   (`VAULTPONY_FULL_POWERLOSS=1`).
+
 ## Removal condition
 
 Delete this directory and the `[patch.crates-io]` entry when a fatfs

@@ -19,7 +19,18 @@ use crate::{BitmapLoc, ExfatError, ExfatResult, ReadAt, WriteAt};
 /// Bitmaps above this size are not cached (a volume this fragmented into
 /// tiny clusters is not something mkfs produces); those fall back to the
 /// on-disk path.
-const MAX_CACHED_BITMAP_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_MAX_CACHED_BITMAP_BYTES: u64 = 64 * 1024 * 1024;
+
+static MAX_CACHED_BITMAP_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_MAX_CACHED_BITMAP_BYTES);
+
+/// Process-wide cap on the in-memory bitmap copy. A process with a tight
+/// memory limit (the iOS File Provider extension, about 20 MB) lowers it;
+/// bitmaps above the cap use the slower on-disk path. Applies to bitmaps
+/// loaded after the call.
+pub fn set_max_cached_bitmap_bytes(bytes: u64) {
+    MAX_CACHED_BITMAP_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// In-memory mirror of the allocation bitmap plus a running free count.
 #[derive(Debug, Default)]
@@ -46,7 +57,7 @@ impl BitmapCache {
                 "allocation bitmap shorter than the cluster heap",
             ));
         }
-        if needed > MAX_CACHED_BITMAP_BYTES {
+        if needed > MAX_CACHED_BITMAP_BYTES.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(false);
         }
         let mut bytes = vec![0u8; needed as usize];

@@ -476,6 +476,38 @@ pub struct VolumeSpace {
     pub cluster_bytes: u64,
 }
 
+/// Let sessions unlocked from now on export a key handoff for the iOS File
+/// Provider extension ([`VaultSession::export_handoff`]). Off by default; the
+/// iOS app turns it on at launch. Android and desktop never call this, so
+/// their sessions keep master keys only inside the XTS engine.
+#[uniffi::export]
+pub fn enable_files_handoff(on: bool) {
+    vault_core::enable_handoff(on);
+}
+
+/// Largest single `read_at` in normal processes (8 MiB) and under the
+/// low-memory profile (1 MiB).
+const READ_CAP: u32 = 8 << 20;
+const READ_CAP_LOW_MEMORY: u32 = 1 << 20;
+static READ_CAP_NOW: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(READ_CAP);
+
+/// Low-memory profile for processes with a tight memory limit (the iOS File
+/// Provider extension, about 20 MB): caps `read_at` at 1 MiB and the exFAT
+/// allocation-bitmap copy at 1 MiB (larger bitmaps are read from disk).
+/// Process-wide; call before unlocking or importing.
+#[uniffi::export]
+pub fn set_low_memory_profile(on: bool) {
+    if on {
+        READ_CAP_NOW.store(READ_CAP_LOW_MEMORY, Ordering::Relaxed);
+        norse_exfat::alloc::set_max_cached_bitmap_bytes(1 << 20);
+    } else {
+        READ_CAP_NOW.store(READ_CAP, Ordering::Relaxed);
+        norse_exfat::alloc::set_max_cached_bitmap_bytes(
+            norse_exfat::alloc::DEFAULT_MAX_CACHED_BITMAP_BYTES,
+        );
+    }
+}
+
 /// Unlock progress: candidate `step` of `total`, currently trying `prf`.
 /// Fired from the unlock thread; implementations must be fast and must not
 /// call back into the session.
@@ -585,6 +617,55 @@ impl VaultSession {
         }))
     }
 
+    /// Open a volume another process unlocked, from its
+    /// [`export_handoff`](Self::export_handoff) blob and this process's own
+    /// dup'd fd to the same container (owned and closed by the session, like
+    /// `unlock_fd`). No KDF runs. `NotFoundOrWrongPassword` if the fd is not
+    /// the container the blob came from. The blob is wiped before returning.
+    #[uniffi::constructor]
+    pub fn import_handoff_fd(fd: i32, blob: Vec<u8>) -> FfiResult<std::sync::Arc<Self>> {
+        let blob = Zeroizing::new(blob);
+        // SAFETY: ownership contract documented on RawFdDevice.
+        let dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
+        let session = vault_core::Session::import_handoff(Box::new(dev), &blob)?;
+        Ok(std::sync::Arc::new(Self {
+            inner: Mutex::new(Some(session)),
+        }))
+    }
+
+    /// Keys, scheme, geometry and a container fingerprint for
+    /// [`import_handoff_fd`](Self::import_handoff_fd) in another process.
+    /// Holds master keys: keep it in memory, pass it straight over XPC, and
+    /// drop it. Fails with `Internal` unless `enable_files_handoff(true)` was
+    /// called before this session was unlocked.
+    pub fn export_handoff(&self) -> FfiResult<Vec<u8>> {
+        with_session(&self.inner, |s| {
+            let blob = s.export_handoff()?;
+            Ok(blob.to_vec())
+        })
+    }
+
+    /// Drop the filesystem and mount it again over the same keys, discarding
+    /// cached allocation state. Call before touching the volume when another
+    /// process (the app or its File Provider extension) wrote to it since this
+    /// session last flushed.
+    pub fn remount(&self) -> FfiResult<()> {
+        with_session(&self.inner, |s| {
+            s.remount()?;
+            Ok(())
+        })
+    }
+
+    /// Put the file at `src` in place of `dst` (replacing it if present), then
+    /// flush. Not atomic on FAT or exFAT: a kill in between leaves `src`
+    /// complete and `dst` missing; rename `src` in to recover.
+    pub fn replace(&self, src: String, dst: String) -> FfiResult<()> {
+        with_session(&self.inner, |s| {
+            s.replace(&src, &dst)?;
+            Ok(())
+        })
+    }
+
     pub fn facts(&self) -> FfiResult<VolumeFacts> {
         with_session(&self.inner, |s| {
             let (scheme, prf) = (s.scheme().to_string(), s.prf().to_string());
@@ -647,9 +728,10 @@ impl VaultSession {
     /// is the random-access primitive proxy file descriptors are built on
     /// (doc §8 — streaming without extraction).
     pub fn read_at(&self, path: String, offset: u64, len: u32) -> FfiResult<Vec<u8>> {
-        // 8 MiB per call keeps a misbehaving caller from ballooning the
-        // process; proxy fds read in much smaller chunks.
-        let len = len.min(8 << 20) as usize;
+        // 8 MiB per call (1 MiB under the low-memory profile) keeps a
+        // misbehaving caller from ballooning the process; proxy fds read in
+        // much smaller chunks.
+        let len = len.min(READ_CAP_NOW.load(Ordering::Relaxed)) as usize;
         with_session(&self.inner, |s| {
             let mut buf = vec![0u8; len];
             let n = s.vfs().read_at(&path, offset, &mut buf)?;
@@ -1210,5 +1292,92 @@ mod tests {
             s.lock();
             let _ = std::fs::remove_file(&tmp);
         }
+    }
+
+    #[test]
+    fn handoff_through_the_ffi_types() {
+        enable_files_handoff(true);
+        let tmp =
+            std::env::temp_dir().join(format!("vaultpony-ffi-handoff-{}.vc", std::process::id()));
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)
+            .unwrap();
+        let pw = "ffi-handoff-password-000001";
+        create_container(
+            f.into_raw_fd(),
+            8 << 20,
+            pw.into(),
+            1,
+            Vec::new(),
+            "AES".into(),
+            "SHA-512".into(),
+            "exFAT".into(),
+        )
+        .unwrap();
+        let fd = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tmp)
+                .unwrap()
+                .into_raw_fd()
+        };
+        let app = VaultSession::unlock_fd(
+            fd(),
+            pw.into(),
+            1,
+            Vec::new(),
+            KdfFilter::Pbkdf2Only,
+            None,
+            None,
+        )
+        .unwrap();
+        app.create("/a.txt".into()).unwrap();
+        app.write_at("/a.txt".into(), 0, b"from the app".to_vec())
+            .unwrap();
+        app.flush().unwrap();
+
+        // (The low-memory profile is process-wide, so it is exercised in
+        // vault-core's own low_memory test binary, not here.)
+        let ext = VaultSession::import_handoff_fd(fd(), app.export_handoff().unwrap()).unwrap();
+        assert_eq!(
+            ext.read_at("/a.txt".into(), 0, 64).unwrap(),
+            b"from the app"
+        );
+        ext.create("/.b.part".into()).unwrap();
+        ext.write_at("/.b.part".into(), 0, b"from Files".to_vec())
+            .unwrap();
+        ext.flush().unwrap();
+        ext.replace("/.b.part".into(), "/b.txt".into()).unwrap();
+        ext.lock();
+
+        app.remount().unwrap();
+        assert_eq!(app.read_at("/b.txt".into(), 0, 64).unwrap(), b"from Files");
+        assert_eq!(app.list("/".into()).unwrap().len(), 2);
+
+        // A blob is refused on any other file.
+        let other =
+            std::env::temp_dir().join(format!("vaultpony-ffi-handoff-b-{}.vc", std::process::id()));
+        std::fs::copy(&tmp, &other).unwrap();
+        let mut bytes = std::fs::read(&other).unwrap();
+        bytes[0] ^= 1; // the salt of the primary header
+        std::fs::write(&other, bytes).unwrap();
+        let other_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&other)
+            .unwrap()
+            .into_raw_fd();
+        assert!(matches!(
+            VaultSession::import_handoff_fd(other_fd, app.export_handoff().unwrap()),
+            Err(VaultError::NotFoundOrWrongPassword)
+        ));
+        app.lock();
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_file(&other).ok();
     }
 }

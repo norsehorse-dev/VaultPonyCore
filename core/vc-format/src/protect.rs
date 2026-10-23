@@ -22,17 +22,35 @@ pub struct ProtectedDevice {
     protected_start: u64,
     protected_end: u64,
     /// Latched on the first blocked write; once set, every write fails.
-    read_only: std::sync::atomic::AtomicBool,
+    /// Shared so the session can read it (and carry it across a File
+    /// Provider handoff) after the device is buried in the filesystem.
+    read_only: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ProtectedDevice {
     /// `protected_start`/`len` are in the wrapped device's coordinate space.
     pub fn new(inner: Box<dyn BlockDevice>, protected_start: u64, protected_len: u64) -> Self {
+        Self::with_latch(
+            inner,
+            protected_start,
+            protected_len,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )
+    }
+
+    /// Like [`new`](Self::new), with a caller-held latch. A latch that is
+    /// already set starts the device read-only.
+    pub fn with_latch(
+        inner: Box<dyn BlockDevice>,
+        protected_start: u64,
+        protected_len: u64,
+        latch: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
         Self {
             inner,
             protected_start,
             protected_end: protected_start.saturating_add(protected_len),
-            read_only: std::sync::atomic::AtomicBool::new(false),
+            read_only: latch,
         }
     }
 

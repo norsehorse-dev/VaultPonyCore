@@ -221,19 +221,28 @@ impl DirFileEntryData {
     }
 
     pub(crate) fn serialize(&self, wrt: &mut Write) -> io::Result<()> {
-        wrt.write_all(&self.name)?;
-        wrt.write_u8(self.attrs.bits())?;
-        wrt.write_u8(self.reserved_0)?;
-        wrt.write_u8(self.create_time_0)?;
-        wrt.write_u16::<LittleEndian>(self.create_time_1)?;
-        wrt.write_u16::<LittleEndian>(self.create_date)?;
-        wrt.write_u16::<LittleEndian>(self.access_date)?;
-        wrt.write_u16::<LittleEndian>(self.first_cluster_hi)?;
-        wrt.write_u16::<LittleEndian>(self.modify_time)?;
-        wrt.write_u16::<LittleEndian>(self.modify_date)?;
-        wrt.write_u16::<LittleEndian>(self.first_cluster_lo)?;
-        wrt.write_u32::<LittleEndian>(self.size)?;
-        Ok(())
+        // VaultPony patch: build the whole 32-byte entry, then write it once.
+        // Field-by-field writes reach the disk as separate writes, so a power
+        // cut or process kill mid-entry could leave a new name over a deleted
+        // entry's old first cluster: a cross-link with a live file (found by
+        // the power-loss harness, fsck "share clusters").
+        let mut buf = [0u8; DIR_ENTRY_SIZE as usize];
+        {
+            let mut cur: &mut [u8] = &mut buf;
+            cur.write_all(&self.name)?;
+            cur.write_u8(self.attrs.bits())?;
+            cur.write_u8(self.reserved_0)?;
+            cur.write_u8(self.create_time_0)?;
+            cur.write_u16::<LittleEndian>(self.create_time_1)?;
+            cur.write_u16::<LittleEndian>(self.create_date)?;
+            cur.write_u16::<LittleEndian>(self.access_date)?;
+            cur.write_u16::<LittleEndian>(self.first_cluster_hi)?;
+            cur.write_u16::<LittleEndian>(self.modify_time)?;
+            cur.write_u16::<LittleEndian>(self.modify_date)?;
+            cur.write_u16::<LittleEndian>(self.first_cluster_lo)?;
+            cur.write_u32::<LittleEndian>(self.size)?;
+        }
+        wrt.write_all(&buf)
     }
 
     pub(crate) fn is_deleted(&self) -> bool {
@@ -285,21 +294,26 @@ impl DirLfnEntryData {
     }
 
     pub(crate) fn serialize(&self, wrt: &mut Write) -> io::Result<()> {
-        wrt.write_u8(self.order)?;
-        for ch in self.name_0.iter() {
-            wrt.write_u16::<LittleEndian>(*ch)?;
+        // VaultPony patch: one write per entry (see DirFileEntryData).
+        let mut buf = [0u8; DIR_ENTRY_SIZE as usize];
+        {
+            let mut cur: &mut [u8] = &mut buf;
+            cur.write_u8(self.order)?;
+            for ch in self.name_0.iter() {
+                cur.write_u16::<LittleEndian>(*ch)?;
+            }
+            cur.write_u8(self.attrs.bits())?;
+            cur.write_u8(self.entry_type)?;
+            cur.write_u8(self.checksum)?;
+            for ch in self.name_1.iter() {
+                cur.write_u16::<LittleEndian>(*ch)?;
+            }
+            cur.write_u16::<LittleEndian>(self.reserved_0)?;
+            for ch in self.name_2.iter() {
+                cur.write_u16::<LittleEndian>(*ch)?;
+            }
         }
-        wrt.write_u8(self.attrs.bits())?;
-        wrt.write_u8(self.entry_type)?;
-        wrt.write_u8(self.checksum)?;
-        for ch in self.name_1.iter() {
-            wrt.write_u16::<LittleEndian>(*ch)?;
-        }
-        wrt.write_u16::<LittleEndian>(self.reserved_0)?;
-        for ch in self.name_2.iter() {
-            wrt.write_u16::<LittleEndian>(*ch)?;
-        }
-        Ok(())
+        wrt.write_all(&buf)
     }
 
     #[cfg(feature = "alloc")]

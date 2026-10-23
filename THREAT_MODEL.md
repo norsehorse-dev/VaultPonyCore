@@ -54,6 +54,48 @@ observe about usage.
   Error variants in `vc-types` are designed to be user-explainable without
   embedding user data.
 
+### Key handoff to the iOS File Provider extension (2.0.0 rc3)
+
+iOS shows an unlocked vault in the Files app through a File Provider
+extension: a separate process held to about 20 MB of memory, where
+Argon2id (416 MiB at the default PIM) can never run. So the app unlocks,
+and hands the extension what it needs to open the same volume. This is
+secrets crossing a process boundary, argued here before it ships:
+
+- **What crosses.** `export_handoff` builds a versioned blob: scheme name,
+  master keys, volume geometry, the hidden flag, the protected range and
+  latch state of an outer-protected session, and a container fingerprint
+  (container length plus the 64-byte salt at the header that unlocked).
+  Never the password, PIM or keyfiles. Without them nobody can re-key or
+  open the other volume of a hidden container from the blob.
+- **Where it goes.** Built in the app's memory, passed in one call over the
+  File Provider XPC service the system restricts to VaultPony's own app
+  (`isRestricted`, the default), wiped by the core once parsed. It is never
+  written to disk, the Keychain, logs or an app-group file. The Swift `Data`
+  copy can't be reliably zeroized, the same caveat THREAT_MODEL-IOS records
+  for passphrases; its lifetime is the XPC call.
+- **Key copies at rest in memory.** A session normally keeps master keys
+  only inside the XTS engine. A process that calls `enable_handoff(true)`
+  (only the iOS app) keeps one more `Zeroizing` copy per session so it can
+  export again later; the expanded cipher keys in the engine already reveal
+  the same secret to anyone who can read process memory, so this adds no
+  new class of exposure. Locking drops and wipes it on the same single path.
+  Android and desktop never enable it.
+- **Wrong file.** Import checks the fingerprint against the fd it was given
+  and refuses any other file, including the same file after a password
+  change (new salt), with the ordinary `NotFoundOrWrongPassword`.
+- **Hidden volumes.** A blob from a hidden-volume session says "hidden", so
+  it is exactly as revealing as the open session it came from, and lives
+  only in the two processes that already hold that session. Shells keep the
+  rule above: nothing persistent or system-visible names the volume type.
+- **Two writers.** The app and the extension then hold two mounts of one
+  volume. They take a cross-process lock per operation, flush at the end of
+  each, and `remount()` (which discards every cached allocation state) when
+  the other side wrote in between. `vault-core/tests/handoff_gate.rs` runs
+  interleaved writers through FAT and exFAT and checks the result with a
+  fresh unlock and `fsck`; skipping the remount there corrupts files, which
+  is why the shells must never skip it.
+
 ### No network attack surface
 
 - The Android manifest declares no INTERNET permission; iOS ships no
@@ -178,6 +220,7 @@ The UX rules hidden volumes impose hold from 1.0 (doc §11):
 | Container bytes ↔ core | parser | fuzzed, memory-safe, fail-closed errors |
 | Core ↔ shells | UniFFI generated glue | scoped buffers, wipe-after-use, glue audit |
 | App ↔ other apps | SAF DocumentsProvider / FileProvider (P11), share sheet | user-initiated only; provider exposes unlocked volumes, never secrets |
+| iOS app ↔ its File Provider extension | key handoff blob + container fd over restricted XPC (rc3) | in memory only, fingerprint-checked, wiped after parse; no password, PIM or keyfiles |
 | App ↔ OS UI | recents, screenshots, indexes, notifications | FLAG_SECURE default-on, recents thumbnails off, zero indexing |
 
 ## Crash and diagnostics policy

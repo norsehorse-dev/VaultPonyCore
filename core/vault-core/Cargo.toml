@@ -17,6 +17,7 @@ getrandom = "0.2"
 log = { workspace = true }
 
 [dev-dependencies]
+norse-exfat = { workspace = true }
 vc-types = { workspace = true }
 vc-fs = { workspace = true }
 vc-format = { workspace = true }

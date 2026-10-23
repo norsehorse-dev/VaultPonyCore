@@ -239,9 +239,10 @@ impl Vfs for FatVfs {
     }
 
     fn flush(&mut self) -> VcResult<()> {
-        // fatfs flushes FSInfo and the dirty flag on unmount/Drop; per-file
-        // data is flushed at each op above. Nothing additional to do here
-        // until we hold long-lived open files (P7 streaming writes).
-        Ok(())
+        // Per-file data is flushed at each op above. Publish FSInfo and clear
+        // the dirty flag now rather than only at unmount: with two sessions on
+        // one volume (the iOS app and its File Provider extension), the one
+        // that remounts must not later write its stale FSInfo over the other's.
+        self.fs.sync_metadata().map_err(fs_err)
     }
 }

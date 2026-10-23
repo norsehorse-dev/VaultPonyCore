@@ -6,7 +6,6 @@
 //! APIs. Read-ahead cache and write-ordering hooks land with the FS layer.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
 use vc_types::VcResult;
 
 /// Random-access block I/O over a container file.
@@ -57,20 +56,74 @@ impl BlockDevice for FileDevice {
         Ok(self.file.metadata()?.len())
     }
 
+    // Positional I/O (pread/pwrite): the file offset is never used, so a
+    // dup'd or passed fd shared with another process (the iOS File Provider
+    // extension, rc3) can't move this device's reads and writes.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> VcResult<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buf)?;
+        pos::read_exact_at(&self.file, buf, offset)?;
         Ok(())
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> VcResult<()> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)?;
+        pos::write_all_at(&self.file, buf, offset)?;
         Ok(())
     }
 
     fn flush(&mut self) -> VcResult<()> {
         self.file.sync_data()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+mod pos {
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+
+    pub fn read_exact_at(f: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+        f.read_exact_at(buf, offset)
+    }
+
+    pub fn write_all_at(f: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+        f.write_all_at(buf, offset)
+    }
+}
+
+#[cfg(windows)]
+mod pos {
+    use std::fs::File;
+    use std::io::{Error, ErrorKind};
+    use std::os::windows::fs::FileExt;
+
+    // seek_read/seek_write move the handle's offset but take an explicit
+    // one each call, so concurrent users of the handle can't misplace them.
+    pub fn read_exact_at(f: &File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            match f.seek_read(buf, offset) {
+                Ok(0) => return Err(Error::new(ErrorKind::UnexpectedEof, "short read")),
+                Ok(n) => {
+                    buf = &mut buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+        while !buf.is_empty() {
+            match f.seek_write(buf, offset) {
+                Ok(0) => return Err(Error::new(ErrorKind::WriteZero, "short write")),
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
         Ok(())
     }
 }
@@ -100,5 +153,31 @@ impl RawFdDevice {
         FileDevice {
             file: File::from(owned),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::{Seek, SeekFrom, Write};
+
+    #[test]
+    fn reads_and_writes_ignore_the_shared_file_offset() {
+        let path = std::env::temp_dir().join(format!("vcio-pos-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 8192]).unwrap();
+        let mut a = FileDevice::open_rw(&path).unwrap();
+        // A second handle on the same open file description, like a dup'd fd
+        // handed to another process.
+        let mut other = a.file.try_clone().unwrap();
+        a.write_at(4096, b"vault").unwrap();
+        other.seek(SeekFrom::Start(100)).unwrap();
+        other.write_all(b"xx").unwrap();
+        let mut buf = [0u8; 5];
+        a.read_at(4096, &mut buf).unwrap();
+        assert_eq!(&buf, b"vault");
+        a.write_at(200, b"yy").unwrap();
+        // The other handle's offset was not moved by this device.
+        assert_eq!(other.stream_position().unwrap(), 102);
+        std::fs::remove_file(&path).ok();
     }
 }
