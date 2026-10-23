@@ -210,6 +210,10 @@ fn effective_secret(keyfiles: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>, ExitCode
         ExitCode::FAILURE
     })?;
     let kf = read_keyfiles(keyfiles)?;
+    if let Err(e) = vc_crypto::check_keyfiles(&kf) {
+        eprintln!("error: {e}");
+        return Err(ExitCode::FAILURE);
+    }
     Ok(vc_crypto::apply_keyfiles(passphrase.as_bytes(), &kf))
 }
 

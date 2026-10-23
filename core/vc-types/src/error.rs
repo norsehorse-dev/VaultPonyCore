@@ -43,6 +43,11 @@ pub enum VcError {
     #[error("filesystem error: {0}")]
     Filesystem(String),
 
+    /// A keyfile with no bytes. VeraCrypt refuses these, so accepting one
+    /// would make or open volumes VeraCrypt can't.
+    #[error("a keyfile is empty")]
+    EmptyKeyfile,
+
     /// The device could not spare the memory an Argon2id derivation needs.
     /// Distinct from a wrong password so the UI can say what happened and
     /// offer a PBKDF2-only unlock instead.

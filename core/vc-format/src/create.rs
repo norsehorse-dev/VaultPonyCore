@@ -91,6 +91,7 @@ fn write_header_copy(
     let mut salt = [0u8; consts::SALT_LEN];
     fill_random(&mut salt)?;
 
+    vc_crypto::check_keyfiles(params.keyfiles)?;
     let secret = vc_crypto::apply_keyfiles(params.passphrase, params.keyfiles);
     let key = vc_crypto::derive_header_key_for(
         params.prf,

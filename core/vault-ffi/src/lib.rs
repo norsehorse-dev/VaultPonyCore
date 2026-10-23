@@ -360,6 +360,7 @@ pub fn restore_header_from_file(
 ) -> FfiResult<()> {
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
+    vc_crypto::check_keyfiles(&keyfiles)?;
     let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
@@ -386,6 +387,7 @@ pub fn restore_header_from_embedded(
 ) -> FfiResult<()> {
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
+    vc_crypto::check_keyfiles(&keyfiles)?;
     let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
@@ -421,6 +423,8 @@ pub fn change_password(
     let new_passphrase = Zeroizing::new(new_passphrase);
     let mut old_keyfiles = old_keyfiles;
     let mut new_keyfiles = new_keyfiles;
+    vc_crypto::check_keyfiles(&old_keyfiles)?;
+    vc_crypto::check_keyfiles(&new_keyfiles)?;
     let old_secret = vc_crypto::apply_keyfiles(old_passphrase.as_bytes(), &old_keyfiles);
     let new_secret = vc_crypto::apply_keyfiles(new_passphrase.as_bytes(), &new_keyfiles);
     for kf in old_keyfiles.iter_mut().chain(new_keyfiles.iter_mut()) {
@@ -484,6 +488,9 @@ pub enum VaultError {
     /// PBKDF2 hashes and 12 for Argon2id).
     #[error("a PIM below {default_pim} needs a password of at least {min_len} characters")]
     PasswordTooShortForPim { min_len: u32, default_pim: u32 },
+    /// A keyfile has no bytes; VeraCrypt refuses those too.
+    #[error("a keyfile is empty")]
+    EmptyKeyfile,
 }
 
 impl From<VcError> for VaultError {
@@ -507,6 +514,7 @@ impl From<VcError> for VaultError {
             VcError::Internal(_) => VaultError::Internal,
             VcError::KdfOutOfMemory { needed_mib } => VaultError::KdfOutOfMemory { needed_mib },
             VcError::Cancelled => VaultError::Cancelled,
+            VcError::EmptyKeyfile => VaultError::EmptyKeyfile,
             VcError::PasswordTooShortForPim {
                 min_len,
                 default_pim,
@@ -631,6 +639,7 @@ impl VaultSession {
         // empty list is the identity. The derived secret is `Zeroizing`, and
         // we wipe the raw keyfile bytes as soon as they've been mixed in.
         let mut keyfiles = keyfiles;
+        vc_crypto::check_keyfiles(&keyfiles)?;
         let secret = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
         for kf in &mut keyfiles {
             kf.zeroize();

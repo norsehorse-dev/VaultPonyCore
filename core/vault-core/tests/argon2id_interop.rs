@@ -274,3 +274,36 @@ fn veracrypt_follows_our_kdf_changes() {
     eprintln!("VeraCrypt followed Argon2id -> Streebog");
     let _ = std::fs::remove_file(&path);
 }
+
+/// Passphrases over 64 bytes use VeraCrypt's 128-byte keyfile pool
+/// (Keyfiles.c: KEYFILE_POOL_SIZE when the password is longer than
+/// MAX_LEGACY_PASSWORD). Checked at the 64/65 boundary, PBKDF2 and Argon2id.
+#[test]
+#[ignore = "needs the VeraCrypt 1.26.29+ console; run explicitly"]
+fn veracrypt_opens_our_long_password_keyfile_containers() {
+    require_vc_with_argon2();
+    let kf = std::env::temp_dir().join(format!("vaultpony-a2i-long-{}.key", std::process::id()));
+    let key: Vec<u8> = (0..4096u32).map(|i| (i * 13 + 5) as u8).collect();
+    std::fs::write(&kf, &key).unwrap();
+    for (len, hash, kdf_label) in [
+        (64usize, "SHA-512", "PBKDF2-HMAC-SHA-512"),
+        (65, "SHA-512", "PBKDF2-HMAC-SHA-512"),
+        (100, "Argon2id", "Argon2"),
+    ] {
+        let pw: String = (0..len).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+        let path = temp(&format!("longpw-{len}"));
+        create(
+            &path,
+            &params("AES", hash, 0, pw.as_bytes(), std::slice::from_ref(&key)),
+        );
+        let got = vc_properties(&path, &pw, 0, Some(&kf));
+        assert!(
+            got.is_some(),
+            "VeraCrypt could not open a {len}-byte password + keyfile volume"
+        );
+        assert_eq!(got.unwrap().1, kdf_label, "{len}");
+        eprintln!("VeraCrypt opened our {len}-byte password + keyfile / {hash} container");
+        let _ = std::fs::remove_file(&path);
+    }
+    let _ = std::fs::remove_file(&kf);
+}
