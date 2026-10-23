@@ -15,6 +15,19 @@ pub enum VcError {
     #[error("container requires a newer VeraCrypt format (min version {required:#06x}) than supported ({supported:#06x})")]
     VersionTooNew { required: u16, supported: u16 },
 
+    /// TrueCrypt mode found a TrueCrypt header from a release before 6.0 (or
+    /// a version field no TrueCrypt release wrote). VeraCrypt's TrueCrypt
+    /// mode refused the same range.
+    #[error(
+        "TrueCrypt volume format {version:#06x} is not supported (TrueCrypt 6.0 to 7.1a only)"
+    )]
+    TrueCryptVersionUnsupported { version: u16 },
+
+    /// A write to a volume opened in TrueCrypt mode. TrueCrypt volumes open
+    /// read-only (plan 6.2); "Convert to VeraCrypt" makes a writable copy.
+    #[error("TrueCrypt volumes open read-only")]
+    TrueCryptReadOnly,
+
     /// Header carries the system-encryption flag; we refuse politely (doc §6).
     #[error("system-encryption volumes are not supported")]
     SystemVolume,
@@ -35,6 +48,11 @@ pub enum VcError {
     /// Name it rather than failing generically (doc §4).
     #[error("container holds a {0} filesystem; not supported yet")]
     UnsupportedFilesystem(String),
+
+    /// The volume is ext4 (or ext2/ext3) but uses a feature the reader
+    /// doesn't support; the detail names it (plan 6.3).
+    #[error("this ext4 volume uses a feature VaultPony can't read yet: {0}")]
+    Ext4Unsupported(String),
 
     /// Filesystem inside the container could not be identified at all.
     #[error("could not identify a filesystem inside the container")]

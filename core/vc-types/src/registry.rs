@@ -392,6 +392,42 @@ mod tests {
     }
 }
 
+/// TrueCrypt mode (2.0.0, plan 6.2): the header-key derivations TrueCrypt
+/// 6.x/7.x used, with its fixed iteration counts. Not generated: VeraCrypt
+/// 1.26 dropped TrueCrypt mode, so these come from the last release that had
+/// it (1.25.9, `get_pkcs5_iteration_count` in Pkcs5.c with `truecryptMode`
+/// set): RIPEMD-160 2000, SHA-512 1000, Whirlpool 1000. TrueCrypt has no PIM.
+/// RIPEMD-160 is derived only on this path; VeraCrypt headers never try it.
+pub const TRUECRYPT_PRFS: [Prf; 3] = [
+    Prf {
+        name: "RIPEMD-160",
+        kdf: Kdf::Pbkdf2,
+        default_iterations: 2000,
+        popularity_rank: 0,
+    },
+    Prf {
+        name: "SHA-512",
+        kdf: Kdf::Pbkdf2,
+        default_iterations: 1000,
+        popularity_rank: 1,
+    },
+    Prf {
+        name: "Whirlpool",
+        kdf: Kdf::Pbkdf2,
+        default_iterations: 1000,
+        popularity_rank: 2,
+    },
+];
+
+/// Whether TrueCrypt could have made a volume with `scheme`: AES, Serpent,
+/// Twofish and their cascades (TrueCrypt never had Camellia or Kuznyechik).
+pub fn is_truecrypt_scheme(scheme: &EncryptionScheme) -> bool {
+    scheme
+        .layers
+        .iter()
+        .all(|c| matches!(c, Cipher::Aes | Cipher::Serpent | Cipher::Twofish))
+}
+
 /// Look a scheme up by its registry name ("AES(Twofish)") or its VeraCrypt
 /// display name ("AES-Twofish"), ignoring case.
 pub fn scheme_by_name(name: &str) -> Option<&'static EncryptionScheme> {
@@ -432,6 +468,37 @@ mod display_tests {
             assert_eq!(s.display_name(), display);
             assert_eq!(scheme_by_name(display).unwrap().name, name);
         }
+    }
+
+    #[test]
+    fn truecrypt_set_matches_truecrypt_7_1a() {
+        let names: Vec<_> = ENCRYPTION_SCHEMES
+            .iter()
+            .filter(|s| is_truecrypt_scheme(s))
+            .map(|s| s.display_name())
+            .collect();
+        let mut want = vec![
+            "AES",
+            "Serpent",
+            "Twofish",
+            "AES-Twofish",
+            "AES-Twofish-Serpent",
+            "Serpent-AES",
+            "Serpent-Twofish-AES",
+            "Twofish-Serpent",
+        ];
+        let mut got = names.clone();
+        got.sort();
+        want.sort();
+        assert_eq!(got, want);
+        let prfs: Vec<_> = TRUECRYPT_PRFS
+            .iter()
+            .map(|p| (p.name, p.default_iterations))
+            .collect();
+        assert_eq!(
+            prfs,
+            vec![("RIPEMD-160", 2000), ("SHA-512", 1000), ("Whirlpool", 1000)]
+        );
     }
 
     #[test]

@@ -66,6 +66,45 @@ pub fn derive_header_key(
     Ok(key)
 }
 
+/// TrueCrypt mode (plan 6.2): PBKDF2 with one of TrueCrypt's PRFs at its
+/// fixed iteration count (`prf.default_iterations` from
+/// `registry::TRUECRYPT_PRFS`; TrueCrypt has no PIM). The only place
+/// RIPEMD-160 is derived: [`derive_header_key`] keeps refusing it, so a
+/// VeraCrypt unlock can never try it.
+pub fn derive_truecrypt_header_key(
+    prf: &Prf,
+    passphrase: &[u8],
+    salt: &[u8; vc_types::consts::SALT_LEN],
+    key_len: usize,
+) -> VcResult<HeaderKey> {
+    debug_assert!(key_len <= 192);
+    if prf.kdf != Kdf::Pbkdf2 {
+        return Err(VcError::Internal(format!(
+            "{} is not a TrueCrypt PRF",
+            prf.name
+        )));
+    }
+    match prf.name {
+        "RIPEMD-160" => {
+            let mut key = HeaderKey {
+                bytes: [0u8; 192],
+                len: key_len,
+            };
+            pbkdf2_hmac::<ripemd::Ripemd160>(
+                passphrase,
+                salt,
+                prf.default_iterations,
+                &mut key.bytes[..key_len],
+            );
+            Ok(key)
+        }
+        "SHA-512" | "Whirlpool" => {
+            derive_header_key(prf.name, passphrase, salt, prf.default_iterations, key_len)
+        }
+        other => Err(VcError::Internal(format!("{other} is not a TrueCrypt PRF"))),
+    }
+}
+
 /// Derive the header key for one KDF candidate at a PIM. PBKDF2 derives
 /// exactly `key_len` bytes; Argon2id always derives its fixed 192 bytes and
 /// keeps the first `key_len`, because asking Argon2 for fewer bytes changes
@@ -303,6 +342,32 @@ mod tests {
         let via = derive_header_key_for(sha512, b"pw", &salt, 1, 64).unwrap();
         let direct = derive_header_key("SHA-512", b"pw", &salt, 16_000, 64).unwrap();
         assert_eq!(via.as_bytes(), direct.as_bytes());
+    }
+
+    #[test]
+    fn truecrypt_ripemd160_matches_reference() {
+        // Python hashlib.pbkdf2_hmac("ripemd160", b"vaultpony",
+        // bytes(range(64)), 2000, 192): OpenSSL, independent of the crate.
+        let salt: [u8; 64] = core::array::from_fn(|i| i as u8);
+        let prf = &vc_types::registry::TRUECRYPT_PRFS[0];
+        let key = derive_truecrypt_header_key(prf, b"vaultpony", &salt, 192).unwrap();
+        assert_eq!(
+            hex(key.as_bytes()),
+            "1bbfb74f5cb00660a549ef94add29601295fdf1fedb341817ab2327eaea682f9\
+             ea983925794ff653f5ff1d7bf696dc5fc23d680a89527ed1b6fb9358e54861cc\
+             71aae565d47835a08e7114dcdfd54b0a8e7013247e310e571fb5d29da14f33a6\
+             25ea0a06d797518bf4e7d3a3c91c21abf1fd396e11f6d03f1520fe3c72692db9\
+             1d89b3bdd68d2a35021c68711aba0052a4631b915d1675c5fd750dba882cefa6\
+             0bb9db66357d2399f08bd0ba48dccbd2869c7ab3a151f5ea282a4a11db1139aa"
+        );
+        // SHA-512 and Whirlpool reuse the VeraCrypt code at 1000 iterations.
+        let sha = &vc_types::registry::TRUECRYPT_PRFS[1];
+        let a = derive_truecrypt_header_key(sha, b"pw", &salt, 64).unwrap();
+        let b = derive_header_key("SHA-512", b"pw", &salt, 1000, 64).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        // Argon2id is never a TrueCrypt PRF.
+        let argon = vc_types::registry::PRFS.last().unwrap();
+        assert!(derive_truecrypt_header_key(argon, b"pw", &salt, 64).is_err());
     }
 
     #[test]

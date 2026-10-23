@@ -132,6 +132,42 @@ secrets crossing a process boundary, argued here before it ships:
   fuzz targets from day one (`cargo-fuzz` in CI, doc §13), and the core is
   memory-safe Rust with `unsafe` treated as a code-review event.
 
+### TrueCrypt mode and read-only ext4 (2.0.0 rc5)
+
+- **TrueCrypt mode is opt-in per unlock.** Only an unlock with the
+  "TrueCrypt mode" box ticked looks for "TRUE" headers, and only those
+  unlocks derive with RIPEMD-160. Ordinary unlocks never try it, so they
+  gain no extra cost and the RIPEMD-160 path is unreachable from them
+  (`derive_header_key` still refuses it; only `derive_truecrypt_header_key`
+  has it).
+- **TrueCrypt's KDF is weak by today's standard**: 1000 or 2000 PBKDF2
+  iterations, fixed, no PIM. A stolen TrueCrypt container is far cheaper to
+  brute-force than a VeraCrypt one. The app can't change that without
+  rewriting the volume, which is why TrueCrypt volumes open read-only and the
+  shells offer "Convert to VeraCrypt": a new container with VeraCrypt's KDF,
+  the files copied across and checked by size and count. The TrueCrypt
+  container is never modified or deleted by the app; the user removes it.
+- **Read-only is enforced twice.** The decrypted device refuses every write
+  and the filesystem reports itself read-only, so neither a shell bug nor the
+  FAT adapter's own housekeeping (FSInfo, dirty bit) can change a TrueCrypt
+  container. Header writes (password change, header restore, hidden-volume
+  protection) refuse TrueCrypt mode outright. The iOS File Provider handoff
+  carries the mode, so the extension's session is read-only too.
+- **Wrong-password timing is uniform within TrueCrypt mode**: three PRFs at
+  four header positions, every time, whatever the container holds.
+- **ext4 is parsed by `ext4-view`** (Google, Apache-2.0 OR MIT, read-only by
+  design, `#![forbid(unsafe_code)]`), vendored with one fix for sparse
+  ext2/ext3 files (third_party/ext4-view/VAULTPONY.md). The journal is
+  replayed in memory, never written. Its state is shared through `Rc`, so the
+  adapter asserts `Send` with an `unsafe impl`: every clone of that `Rc`
+  stays inside the adapter and is only touched behind `&mut self` and the
+  session lock (the argument is next to the impl in `vc-fs/src/ext4.rs`).
+  That impl is a review gate like any other `unsafe`.
+- **No symlink is followed.** Links, FIFOs, sockets and device nodes are
+  listed as size-0 entries that refuse reads, and a path through a link
+  fails, so nothing in an ext4 volume can point a read anywhere a listing
+  didn't show. Owners and permission bits are not shown or kept.
+
 ### Hidden-volume read (P8): deniability properties
 
 Hidden-volume read has shipped. What the implementation guarantees, and how

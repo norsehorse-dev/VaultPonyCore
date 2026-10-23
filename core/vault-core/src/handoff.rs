@@ -35,6 +35,7 @@ const VERSION: u8 = 1;
 const FLAG_HIDDEN: u8 = 1;
 const FLAG_PROTECTED: u8 = 2;
 const FLAG_TRIPPED: u8 = 4;
+const FLAG_TRUECRYPT: u8 = 8;
 
 /// What a session remembers about how it was opened. `keys` is empty unless
 /// handoff was enabled when the session was unlocked.
@@ -49,6 +50,9 @@ pub(crate) struct KeyRecord {
     pub hidden: bool,
     /// Outer-protected sessions: the shielded range in data-area offsets.
     pub protected: Option<(u64, u64)>,
+    /// Opened in TrueCrypt mode: `prf` is from `TRUECRYPT_PRFS`, and the
+    /// importing process opens the volume read-only too.
+    pub truecrypt: bool,
 }
 
 impl KeyRecord {
@@ -70,6 +74,9 @@ impl KeyRecord {
         }
         if tripped {
             flags |= FLAG_TRIPPED;
+        }
+        if self.truecrypt {
+            flags |= FLAG_TRUECRYPT;
         }
         out.push(flags);
         put_str(&mut out, self.scheme.name);
@@ -107,10 +114,18 @@ impl KeyRecord {
             .iter()
             .find(|s| s.name == scheme_name)
             .ok_or_else(bad)?;
-        let prf = vc_types::registry::PRFS
-            .iter()
-            .find(|p| p.name == prf_name)
-            .ok_or_else(bad)?;
+        let truecrypt = flags & FLAG_TRUECRYPT != 0;
+        let prfs: &'static [Prf] = if truecrypt {
+            &vc_types::registry::TRUECRYPT_PRFS
+        } else {
+            vc_types::registry::PRFS
+        };
+        let prf = prfs.iter().find(|p| p.name == prf_name).ok_or_else(bad)?;
+        if truecrypt
+            && (flags & FLAG_PROTECTED != 0 || !vc_types::registry::is_truecrypt_scheme(scheme))
+        {
+            return Err(bad());
+        }
         let key_len = r.u16().ok_or_else(bad)? as usize;
         if key_len != scheme.key_bytes() {
             return Err(bad());
@@ -161,6 +176,7 @@ impl KeyRecord {
                 container_len,
                 hidden: flags & FLAG_HIDDEN != 0,
                 protected,
+                truecrypt,
             },
             flags & FLAG_TRIPPED != 0,
         ))

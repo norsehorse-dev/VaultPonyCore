@@ -194,6 +194,7 @@ fn secret<'a>(
         pim,
         kdf: kdf.into(),
         cancel: cancel.as_deref().map(|c| &c.flag),
+        truecrypt: false,
     }
 }
 
@@ -491,6 +492,19 @@ pub enum VaultError {
     /// A keyfile has no bytes; VeraCrypt refuses those too.
     #[error("a keyfile is empty")]
     EmptyKeyfile,
+    /// A write to a volume opened in TrueCrypt mode, which is read-only.
+    /// Shells check `VolumeFacts.writable` first; this is the backstop.
+    #[error("TrueCrypt volumes open read-only")]
+    TrueCryptReadOnly,
+    /// TrueCrypt mode found a header from before TrueCrypt 6.0 (or a version
+    /// no TrueCrypt release wrote). `version` is the header's required
+    /// program version (0x0500 = TrueCrypt 5.0).
+    #[error("TrueCrypt volume format not supported")]
+    TrueCryptVersionUnsupported { version: u32 },
+    /// An ext4 (or ext2/ext3) volume using a feature the reader doesn't
+    /// support; `detail` names it, in English, for the message's tail.
+    #[error("this ext4 volume uses a feature VaultPony can't read yet: {detail}")]
+    Ext4Unsupported { detail: String },
 }
 
 impl From<VcError> for VaultError {
@@ -515,6 +529,13 @@ impl From<VcError> for VaultError {
             VcError::KdfOutOfMemory { needed_mib } => VaultError::KdfOutOfMemory { needed_mib },
             VcError::Cancelled => VaultError::Cancelled,
             VcError::EmptyKeyfile => VaultError::EmptyKeyfile,
+            VcError::TrueCryptReadOnly => VaultError::TrueCryptReadOnly,
+            VcError::Ext4Unsupported(detail) => VaultError::Ext4Unsupported { detail },
+            VcError::TrueCryptVersionUnsupported { version } => {
+                VaultError::TrueCryptVersionUnsupported {
+                    version: version as u32,
+                }
+            }
             VcError::PasswordTooShortForPim {
                 min_len,
                 default_pim,
@@ -548,6 +569,8 @@ pub struct VolumeFacts {
     pub outer_protected: bool,
     /// Per-file size limit of the filesystem, if it has one (FAT: 4 GiB - 1).
     pub max_file_bytes: Option<u64>,
+    /// Opened in TrueCrypt mode (read-only; "Convert to VeraCrypt" applies).
+    pub truecrypt: bool,
 }
 
 /// Total and free space of an unlocked volume. Separate from `VolumeFacts`
@@ -559,6 +582,53 @@ pub struct VolumeSpace {
     pub free_bytes: u64,
     /// Allocation unit; every file takes a whole number of these.
     pub cluster_bytes: u64,
+}
+
+/// What copying one volume into another would take (`VaultSession::plan_copy_to`).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CopyPlan {
+    pub files: u64,
+    pub folders: u64,
+    /// Bytes of file content.
+    pub bytes: u64,
+    /// Space the content takes in the destination (whole clusters per file).
+    pub needed_bytes: u64,
+    /// Links and special files (ext4), which are not copied.
+    pub skipped: Vec<String>,
+    /// Files larger than the destination filesystem allows (FAT: 4 GiB - 1).
+    /// The copy refuses to start while this is non-empty: create the new
+    /// container as exFAT instead.
+    pub too_big: Vec<String>,
+}
+
+/// Counts for one volume (`VaultSession::summarize_tree`).
+#[derive(uniffi::Record, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreeSummary {
+    pub files: u64,
+    pub folders: u64,
+    pub bytes: u64,
+    /// Size of the largest file. Over 4 GiB - 1 means a FAT destination
+    /// can't hold it: create the new container as exFAT.
+    pub largest_file: u64,
+}
+
+/// What a finished, verified copy did (`VaultSession::copy_tree_to`).
+#[derive(uniffi::Record, Debug, Clone, PartialEq, Eq)]
+pub struct CopyReport {
+    pub files: u64,
+    pub folders: u64,
+    pub bytes: u64,
+    /// Items stored under another name (characters FAT/exFAT can't hold, or
+    /// a name already taken without regard to case).
+    pub renamed: u64,
+    pub skipped: u64,
+}
+
+/// Copy progress, fired from the copying thread. Must be fast and must not
+/// call back into either session.
+#[uniffi::export(with_foreign)]
+pub trait CopyProgressListener: Send + Sync {
+    fn on_progress(&self, files_done: u64, files_total: u64, bytes_done: u64, bytes_total: u64);
 }
 
 /// Let sessions unlocked from now on export a key handoff for the iOS File
@@ -608,6 +678,16 @@ pub struct VaultSession {
     inner: Mutex<Option<vault_core::Session>>,
 }
 
+impl VaultSession {
+    /// Copying a session into itself is refused.
+    fn check_pair(&self, other: &Arc<VaultSession>) -> FfiResult<()> {
+        if std::ptr::eq(self, Arc::as_ptr(other)) {
+            return Err(VaultError::Internal);
+        }
+        Ok(())
+    }
+}
+
 fn with_session<T>(
     slot: &Mutex<Option<vault_core::Session>>,
     f: impl FnOnce(&mut vault_core::Session) -> FfiResult<T>,
@@ -654,6 +734,47 @@ impl VaultSession {
         let session = vault_core::Session::unlock_device_with(
             Box::new(dev),
             &self::secret(&secret, pim, kdf, &cancel),
+            &mut progress,
+        )?;
+        Ok(std::sync::Arc::new(Self {
+            inner: Mutex::new(Some(session)),
+        }))
+    }
+
+    /// Unlock a TrueCrypt 6.x/7.x volume (VeraCrypt's "TrueCrypt mode", plan
+    /// 6.2). Same fd contract as `unlock_fd`. TrueCrypt has no PIM and no
+    /// hash choice: the search tries RIPEMD-160, SHA-512 and Whirlpool at
+    /// TrueCrypt's iteration counts, which takes well under a second. The
+    /// session is read-only (`VolumeFacts.truecrypt` and `writable` say so);
+    /// copy it into a new VeraCrypt container with `copy_tree` to write.
+    #[uniffi::constructor]
+    pub fn unlock_truecrypt_fd(
+        fd: i32,
+        passphrase: String,
+        keyfiles: Vec<Vec<u8>>,
+        cancel: Option<Arc<UnlockCancel>>,
+        listener: Option<std::sync::Arc<dyn UnlockProgressListener>>,
+    ) -> FfiResult<std::sync::Arc<Self>> {
+        let passphrase = Zeroizing::new(passphrase);
+        let mut keyfiles = keyfiles;
+        vc_crypto::check_keyfiles(&keyfiles)?;
+        let secret = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+        for kf in &mut keyfiles {
+            kf.zeroize();
+        }
+        // SAFETY: ownership contract documented on `unlock_fd` / RawFdDevice.
+        let dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
+        let mut progress = |step: usize, total: usize, prf: &str| {
+            if let Some(l) = &listener {
+                l.on_progress(step as u32, total as u32, prf.to_string());
+            }
+        };
+        let session = vault_core::Session::unlock_device_with(
+            Box::new(dev),
+            &vault_core::UnlockSecret {
+                truecrypt: true,
+                ..self::secret(&secret, 0, KdfFilter::Auto, &cancel)
+            },
             &mut progress,
         )?;
         Ok(std::sync::Arc::new(Self {
@@ -754,10 +875,74 @@ impl VaultSession {
         })
     }
 
+    /// Count this volume's files, folders and bytes, and its largest file
+    /// (links and special files left out). Reads only.
+    pub fn summarize_tree(&self) -> FfiResult<TreeSummary> {
+        let t = vault_core::summarize_tree(&self.inner)?;
+        Ok(TreeSummary {
+            files: t.files,
+            folders: t.folders,
+            bytes: t.bytes,
+            largest_file: t.largest_file,
+        })
+    }
+
+    /// Walk this volume and say what copying it into `dst` would take
+    /// ("Convert to VeraCrypt", plan 6.2). Reads only.
+    pub fn plan_copy_to(&self, dst: Arc<VaultSession>) -> FfiResult<CopyPlan> {
+        self.check_pair(&dst)?;
+        let p = vault_core::plan_copy(&self.inner, &dst.inner)?;
+        Ok(CopyPlan {
+            files: p.files,
+            folders: p.folders,
+            bytes: p.bytes,
+            needed_bytes: p.needed_bytes,
+            skipped: p.skipped,
+            too_big: p.too_big,
+        })
+    }
+
+    /// Copy every file and folder of this volume into the root of `dst` (a
+    /// new, empty, writable volume), then check every file's size and the
+    /// counts in `dst`. This volume is only read. Names FAT/exFAT can't hold
+    /// are cleaned up and taken names get " (n)", as in bulk import; links
+    /// and special files are skipped. Each filesystem call takes the
+    /// sessions' locks on its own, so the UI can keep browsing and locking
+    /// either vault stops the copy (`Cancelled`). Cancel stops between
+    /// chunks and removes the partly written file; what was already copied
+    /// stays, and the shell offers to delete the new container.
+    pub fn copy_tree_to(
+        &self,
+        dst: Arc<VaultSession>,
+        cancel: Option<Arc<UnlockCancel>>,
+        listener: Option<Arc<dyn CopyProgressListener>>,
+    ) -> FfiResult<CopyReport> {
+        self.check_pair(&dst)?;
+        let mut progress = |p: &vault_core::CopyProgress| {
+            if let Some(l) = &listener {
+                l.on_progress(p.files_done, p.files_total, p.bytes_done, p.bytes_total);
+            }
+        };
+        let r = vault_core::copy_tree(
+            &self.inner,
+            &dst.inner,
+            cancel.as_deref().map(|c| &c.flag),
+            &mut progress,
+        )?;
+        Ok(CopyReport {
+            files: r.files,
+            folders: r.folders,
+            bytes: r.bytes,
+            renamed: r.renamed,
+            skipped: r.skipped,
+        })
+    }
+
     pub fn facts(&self) -> FfiResult<VolumeFacts> {
         with_session(&self.inner, |s| {
             let (scheme, prf) = (s.scheme().to_string(), s.prf().to_string());
             let (hidden, outer_protected) = (s.is_hidden(), s.is_outer_protected());
+            let truecrypt = s.is_truecrypt();
             let max_file_bytes = s.max_file_bytes();
             let vfs = s.vfs();
             Ok(VolumeFacts {
@@ -768,6 +953,7 @@ impl VaultSession {
                 hidden,
                 outer_protected,
                 max_file_bytes,
+                truecrypt,
             })
         })
     }

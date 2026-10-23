@@ -32,6 +32,12 @@ pub struct UnlockSecret<'a> {
     /// derivation, so it takes effect within one derivation (one Argon2id
     /// pass set cannot be interrupted partway).
     pub cancel: Option<&'a AtomicBool>,
+    /// TrueCrypt mode (plan 6.2), VeraCrypt's "TrueCrypt mode" checkbox:
+    /// look for TrueCrypt 6.x/7.x headers ("TRUE") with TrueCrypt's PRFs
+    /// and iteration counts instead of VeraCrypt ones. `pim` and `kdf` are
+    /// ignored (TrueCrypt has neither). Off for every VeraCrypt unlock, so
+    /// ordinary unlocks never pay for the extra derivations.
+    pub truecrypt: bool,
 }
 
 impl<'a> UnlockSecret<'a> {
@@ -42,6 +48,7 @@ impl<'a> UnlockSecret<'a> {
             pim,
             kdf: KdfFilter::Auto,
             cancel: None,
+            truecrypt: false,
         }
     }
 
@@ -83,6 +90,8 @@ pub struct FoundHeader {
     pub header: VolumeHeader,
     pub scheme: &'static vc_types::EncryptionScheme,
     pub prf: &'static vc_types::Prf,
+    /// A TrueCrypt header (TrueCrypt mode). Such volumes open read-only.
+    pub truecrypt: bool,
 }
 
 /// Search for a header that validates. The supplied password alone decides
@@ -132,10 +141,12 @@ pub fn find_header_at(
 ) -> VcResult<FoundHeader> {
     let len = container.len()?;
 
+    let truecrypt = secret.truecrypt;
     let supported: Vec<&'static vc_types::EncryptionScheme> =
         vc_types::registry::ENCRYPTION_SCHEMES
             .iter()
             .filter(|s| vc_crypto::SchemeXts::supported(s))
+            .filter(|s| !truecrypt || vc_types::registry::is_truecrypt_scheme(s))
             .collect();
     let max_key_len = supported.iter().map(|s| s.key_bytes()).max().unwrap_or(0);
     if max_key_len == 0 {
@@ -168,10 +179,14 @@ pub fn find_header_at(
         });
     }
 
-    let prfs: Vec<&'static vc_types::Prf> = vc_types::registry::PRFS
-        .iter()
-        .filter(|p| secret.kdf.allows(p))
-        .collect();
+    let prfs: Vec<&'static vc_types::Prf> = if truecrypt {
+        vc_types::registry::TRUECRYPT_PRFS.iter().collect()
+    } else {
+        vc_types::registry::PRFS
+            .iter()
+            .filter(|p| secret.kdf.allows(p))
+            .collect()
+    };
     let total = slots.len() * prfs.len();
 
     // A magic match with a bad CRC or refused flags is a *finding*, not a
@@ -195,12 +210,13 @@ pub fn find_header_at(
             progress(step, total, default_prf.name);
             step += 1;
             let key = derive_for(default_prf, secret, &first.salt, max_key_len)?;
-            match try_schemes(&supported, &key, &first.enc, first.position) {
+            match try_schemes(&supported, &key, &first.enc, first.position, truecrypt) {
                 SchemeOutcome::Found(header, scheme) => {
                     return Ok(FoundHeader {
                         header: *header,
                         scheme,
                         prf: default_prf,
+                        truecrypt,
                     })
                 }
                 SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -229,12 +245,13 @@ pub fn find_header_at(
             for (slot, key) in others.iter().zip(keys) {
                 progress(step, total, default_prf.name);
                 step += 1;
-                match try_schemes(&supported, &key?, &slot.enc, slot.position) {
+                match try_schemes(&supported, &key?, &slot.enc, slot.position, truecrypt) {
                     SchemeOutcome::Found(header, scheme) => {
                         return Ok(FoundHeader {
                             header: *header,
                             scheme,
                             prf: default_prf,
+                            truecrypt,
                         })
                     }
                     SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -268,12 +285,13 @@ pub fn find_header_at(
                     secret.pim,
                     max_key_len,
                 )?;
-                match try_schemes(&supported, &key, &slot.enc, slot.position) {
+                match try_schemes(&supported, &key, &slot.enc, slot.position, truecrypt) {
                     SchemeOutcome::Found(header, scheme) => {
                         return Ok(FoundHeader {
                             header: *header,
                             scheme,
                             prf,
+                            truecrypt,
                         })
                     }
                     SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -292,12 +310,13 @@ pub fn find_header_at(
         for (slot, key) in slots.iter().zip(keys) {
             progress(step, total, prf.name);
             step += 1;
-            match try_schemes(&supported, &key?, &slot.enc, slot.position) {
+            match try_schemes(&supported, &key?, &slot.enc, slot.position, truecrypt) {
                 SchemeOutcome::Found(header, scheme) => {
                     return Ok(FoundHeader {
                         header: *header,
                         scheme,
                         prf,
+                        truecrypt,
                     })
                 }
                 SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -318,6 +337,9 @@ fn derive_for(
     salt: &[u8; consts::SALT_LEN],
     key_len: usize,
 ) -> VcResult<vc_crypto::HeaderKey> {
+    if secret.truecrypt {
+        return vc_crypto::derive_truecrypt_header_key(prf, secret.passphrase, salt, key_len);
+    }
     vc_crypto::derive_header_key_for(prf, secret.passphrase, salt, secret.pim, key_len)
 }
 
@@ -334,6 +356,7 @@ fn try_schemes(
     key: &vc_crypto::HeaderKey,
     enc: &[u8; consts::HEADER_ENC_LEN],
     position: HeaderPosition,
+    truecrypt: bool,
 ) -> SchemeOutcome {
     let mut finding = None;
     for scheme in supported {
@@ -346,7 +369,12 @@ fn try_schemes(
         // leaving key material on the stack for freed pages or swap.
         let mut dec = zeroize::Zeroizing::new(*enc);
         xts.decrypt_header(&mut dec);
-        match parse::parse_decrypted_header(&dec, position) {
+        let parsed = if truecrypt {
+            parse::parse_truecrypt_header(&dec, position)
+        } else {
+            parse::parse_decrypted_header(&dec, position)
+        };
+        match parsed {
             Ok(header) => return SchemeOutcome::Found(Box::new(header), scheme),
             Err(VcError::NotFoundOrWrongPassword) => continue,
             // Magic matched but validation failed: keep the diagnosis, keep

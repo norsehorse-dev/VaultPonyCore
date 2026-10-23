@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz", "third_party/fatfs"]
+exclude = ["fuzz", "third_party/fatfs", "third_party/ext4-view"]
 members = [
     "core/vc-types",
     "core/vc-format",
@@ -43,6 +43,9 @@ sha2 = "0.10"
 blake2 = "0.10"
 streebog = "0.10"
 pbkdf2 = "0.12"
+# RIPEMD-160 for TrueCrypt mode only (2.0.0, plan 6.2). 0.1 is the digest-0.10
+# line, matching hmac/pbkdf2 above.
+ripemd = "0.1"
 # Argon2id header KDF (VeraCrypt 1.26.29+). No default features: we hand it
 # our own block buffer, so it never allocates, and `zeroize` wipes that buffer.
 argon2 = { version = "0.5", default-features = false, features = ["zeroize"] }
@@ -56,6 +59,8 @@ zeroize = { version = "1", features = ["zeroize_derive"] }
 # vendored copy's chrono glue trips deprecation warnings as a path dep.
 fatfs = { version = "0.3", default-features = false, features = ["std", "alloc"] }
 ntfs = "0.4"
+# ext4, read-only (2.0.0, plan 6.3). Read-only by design; std for its Error impls.
+ext4-view = { version = "1.0", features = ["std"] }
 
 # fatfs is patched in-tree until upstream releases the dot-entry LFN fix
 # (see third_party/fatfs/VAULTPONY.md). Keep the patch adjacent to the dep.
@@ -81,3 +86,5 @@ codegen-units = 1
 
 [patch.crates-io]
 fatfs = { path = "third_party/fatfs" }
+# Sparse ext2/ext3 file fix, see third_party/ext4-view/VAULTPONY.md.
+ext4-view = { path = "third_party/ext4-view" }

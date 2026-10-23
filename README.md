@@ -17,15 +17,15 @@ or linked.
 | core/vc-format | Header discovery, candidate search, decrypt/validate, backup headers |
 | core/vc-crypto | Header-key derivation (PBKDF2, Argon2id), XTS engine including cascades |
 | core/vc-io | Block-device trait: std::fs file (desktop) and raw-fd (mobile) |
-| core/vc-fs | VFS trait and adapters: fatfs (RW), norse-exfat, ntfs (RO) |
+| core/vc-fs | VFS trait and adapters: fatfs (RW), norse-exfat, ntfs (RO), ext4-view (RO) |
 | core/norse-exfat | Our exFAT implementation |
 | core/vault-core | Sessions, unlock flow, mount table, auto-lock |
 | core/vault-ffi | UniFFI boundary to Kotlin and Swift bindings |
 | core/vaultpony-cli | Headless CLI; doubles as test harness and support tool |
 | tools/gen-fixtures | Matrix generator and fixture corpus builder |
 
-third_party/fatfs is a patched vendor copy (MIT; see its VAULTPONY.md for why,
-and when it is removed).
+third_party/fatfs and third_party/ext4-view are patched vendor copies (see
+each VAULTPONY.md for why, and when it is removed).
 
 ## Build
 

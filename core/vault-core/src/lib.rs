@@ -4,10 +4,15 @@
 //! Owns every secret lifecycle: passphrases and keys live exactly as long
 //! as a session needs them and are zeroized on lock (doc §11).
 
+pub mod convert;
 pub mod handoff;
 pub mod probe;
+mod readonly;
 pub mod session;
 
+pub use convert::{
+    copy_tree, plan_copy, summarize_tree, CopyPlan, CopyProgress, CopyReport, TreeSummary,
+};
 pub use handoff::enable_handoff;
 pub use probe::{probe, probe_with, HeaderSource, VolumeInfo};
 pub use session::{

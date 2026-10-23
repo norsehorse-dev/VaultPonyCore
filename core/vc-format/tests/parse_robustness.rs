@@ -107,3 +107,32 @@ fn valid_header_with_recomputed_crcs_parses_after_field_fuzz() {
         }
     }
 }
+
+#[test]
+fn truecrypt_parser_never_panics() {
+    use vc_format::parse::parse_truecrypt_header;
+    let mut rng = Rng(0x7C0D_E000_0000_0071);
+    let mut buf = [0u8; 448];
+    for i in 0..20_000 {
+        rng.fill(&mut buf);
+        if i % 2 == 0 {
+            buf[0..4].copy_from_slice(b"TRUE");
+            // Half of these with a plausible version, to reach the CRC paths.
+            buf[4..6].copy_from_slice(&(4 + (i as u16 / 2) % 2).to_be_bytes());
+        }
+        let _ = parse_truecrypt_header(&buf, HeaderPosition::Primary);
+    }
+    let mut base = valid_header();
+    base[0..4].copy_from_slice(b"TRUE");
+    base[6..8].copy_from_slice(&0x0700u16.to_be_bytes());
+    let f_crc = crc32fast::hash(&base[..188]);
+    base[188..192].copy_from_slice(&f_crc.to_be_bytes());
+    assert!(parse_truecrypt_header(&base, HeaderPosition::Primary).is_ok());
+    for pos in 0..448 {
+        for bit in 0..8u8 {
+            let mut h = base;
+            h[pos] ^= 1 << bit;
+            let _ = parse_truecrypt_header(&h, HeaderPosition::Primary);
+        }
+    }
+}

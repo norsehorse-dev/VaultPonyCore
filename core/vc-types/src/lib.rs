@@ -23,6 +23,8 @@ pub mod consts {
     pub const HEADER_REGION_LEN: usize = SALT_LEN + HEADER_ENC_LEN;
     /// ASCII "VERA" magic at the start of a successfully decrypted header.
     pub const HEADER_MAGIC: [u8; 4] = *b"VERA";
+    /// ASCII "TRUE": the same position in a TrueCrypt 6.x/7.x header.
+    pub const TRUECRYPT_MAGIC: [u8; 4] = *b"TRUE";
     /// Offset of the primary header from the start of the container.
     pub const PRIMARY_HEADER_OFFSET: u64 = 0;
     /// Offset of the hidden-volume header from the start of the container.

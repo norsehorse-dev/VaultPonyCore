@@ -4,7 +4,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vc_format::parse::parse_decrypted_header;
+use vc_format::parse::{parse_decrypted_header, parse_truecrypt_header};
 use vc_types::HeaderPosition;
 
 fuzz_target!(|data: &[u8]| {
@@ -17,4 +17,7 @@ fuzz_target!(|data: &[u8]| {
     // Also exercise the interesting paths past the magic gate.
     buf[0..4].copy_from_slice(b"VERA");
     let _ = parse_decrypted_header(&buf, HeaderPosition::Primary);
+    // TrueCrypt mode's parser (2.0.0 rc5).
+    buf[0..4].copy_from_slice(b"TRUE");
+    let _ = parse_truecrypt_header(&buf, HeaderPosition::Primary);
 });

@@ -6,6 +6,7 @@
 
 pub mod detect;
 pub mod exfat;
+pub mod ext4;
 pub mod fat;
 pub mod io;
 pub mod ntfs_ro;
@@ -181,7 +182,7 @@ pub fn format_exfat(dev: Box<dyn vc_io::BlockDevice>, serial: u32) -> VcResult<(
 }
 
 /// Open the right adapter for the decrypted volume, or a *named* refusal
-/// (doc §4: "this container holds ext4" beats a generic failure).
+/// (doc §4: naming what the container holds beats a generic failure).
 pub fn open_volume(mut dev: Box<dyn vc_io::BlockDevice>) -> VcResult<Box<dyn Vfs>> {
     let mut boot = [0u8; 4096];
     dev.read_at(0, &mut boot)?;
@@ -189,7 +190,7 @@ pub fn open_volume(mut dev: Box<dyn vc_io::BlockDevice>) -> VcResult<Box<dyn Vfs
         FsKind::Fat => Ok(Box::new(fat::FatVfs::open(io::DeviceIo::new(dev)?)?)),
         FsKind::Exfat => Ok(Box::new(exfat::ExfatVfs::open(dev)?)),
         FsKind::Ntfs => Ok(Box::new(ntfs_ro::NtfsVfs::open(dev)?)),
-        FsKind::Ext4 => Err(VcError::UnsupportedFilesystem("ext4".into())),
+        FsKind::Ext4 => Ok(Box::new(ext4::Ext4Vfs::open(dev)?)),
         FsKind::Unknown => Err(VcError::UnknownFilesystem),
     }
 }

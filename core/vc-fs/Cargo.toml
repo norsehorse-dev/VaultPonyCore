@@ -12,6 +12,7 @@ vc-io = { workspace = true }
 norse-exfat = { workspace = true }
 fatfs = { workspace = true }
 ntfs = { workspace = true }
+ext4-view = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]

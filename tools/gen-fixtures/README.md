@@ -48,3 +48,17 @@ the same reviewed change, never blindly.
   the decrypted image for `fsck.fat` / `mtools` checks.
 - Large (>4 GiB) files inside fixtures are deferred to P5 so the corpus
   stays small enough to cache in CI.
+
+## 2.0.0 rc5: TrueCrypt and ext4
+
+- `create_rc5_fixtures.py` builds containers with TrueCrypt 7.1a itself
+  (every PRF, ciphers and cascades, a keyfile and a hidden volume) and
+  VeraCrypt containers holding ext4, into `fixtures/rc5/` with
+  `manifest-rc5.json`. Needs root (it mounts), both CLIs, and e2fsprogs.
+  These are the release gate for TrueCrypt mode and read-only ext4.
+- `synth_truecrypt.py` writes small AES TrueCrypt-format containers into
+  `fixtures/synth-tc/` with OpenSSL (hashlib PBKDF2, `cryptography` AES-XTS),
+  sharing no code with the core, so the TrueCrypt-mode tests run on any box
+  with mkfs.fat and mtools.
+- The ext4 gate (`core/vault-core/tests/ext4_gate.rs`) builds its own images
+  with `mke2fs -d` and needs no fixtures.

@@ -56,6 +56,15 @@ impl vc_io::BlockDevice for SliceDevice<'_> {
     }
 }
 
+/// Header writes never happen in TrueCrypt mode: TrueCrypt volumes open
+/// read-only, and writing a "TRUE" header is a format upstream abandoned.
+fn refuse_truecrypt(secret: &UnlockSecret<'_>) -> VcResult<()> {
+    if secret.truecrypt {
+        return Err(VcError::TrueCryptReadOnly);
+    }
+    Ok(())
+}
+
 /// Restore the primary header from an exported backup file. The backup's
 /// primary slot must unlock with `secret` before a single byte is written
 /// (verify-then-write, never the reverse).
@@ -64,6 +73,7 @@ pub fn restore_from_file(
     backup: &[u8],
     secret: &UnlockSecret<'_>,
 ) -> VcResult<FoundHeader> {
+    refuse_truecrypt(secret)?;
     if backup.len() != HEADER_GROUP as usize {
         return Err(VcError::Internal(format!(
             "backup must be {HEADER_GROUP} bytes, got {}",
@@ -117,6 +127,8 @@ pub fn change_password_to(
     new_prf: Option<&'static vc_types::Prf>,
     new_typed_password: &[u8],
 ) -> VcResult<()> {
+    refuse_truecrypt(old)?;
+    refuse_truecrypt(new)?;
     let len = dev.len()?;
     // Identify the volume the OLD password opens, and its cipher/PRF.
     let found = find_header_at(
@@ -202,6 +214,7 @@ pub fn restore_primary_from_embedded(
     dev: &mut dyn vc_io::BlockDevice,
     secret: &UnlockSecret<'_>,
 ) -> VcResult<FoundHeader> {
+    refuse_truecrypt(secret)?;
     let found = find_header_at(
         dev,
         secret,

@@ -8,6 +8,7 @@
 //! cache arrive with the shells (P3+) — this is the core they will call.
 
 use crate::handoff::{handoff_enabled, KeyRecord};
+use crate::readonly::{ReadOnlyDevice, ReadOnlyVfs};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -127,6 +128,8 @@ pub struct Session {
     hidden: bool,
     /// Outer volume opened with hidden-volume write protection.
     outer_protected: bool,
+    /// Opened in TrueCrypt mode: the device and filesystem refuse writes.
+    truecrypt: bool,
 }
 
 /// A block device several owners can hold: the session and its filesystem.
@@ -209,6 +212,26 @@ fn unmounted() -> VcError {
     VcError::Internal("filesystem not mounted".into())
 }
 
+/// The decrypted device a session sits on: TrueCrypt volumes get the
+/// write-refusing wrapper underneath everything else.
+fn session_device(dev: Box<dyn BlockDevice>, truecrypt: bool) -> SharedDevice {
+    if truecrypt {
+        SharedDevice::new(Box::new(ReadOnlyDevice(dev)))
+    } else {
+        SharedDevice::new(dev)
+    }
+}
+
+/// Mount the filesystem over a session's device, read-only for TrueCrypt.
+fn mount(device: &SharedDevice, truecrypt: bool) -> VcResult<Box<dyn Vfs>> {
+    let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
+    Ok(if truecrypt {
+        Box::new(ReadOnlyVfs(vfs))
+    } else {
+        vfs
+    })
+}
+
 /// Capture how a header opened, before the header (and its keys) is dropped.
 fn key_record(
     dev: &mut dyn BlockDevice,
@@ -235,6 +258,7 @@ fn key_record(
         container_len,
         hidden: found.header.position.is_hidden(),
         protected,
+        truecrypt: found.truecrypt,
     })
 }
 
@@ -299,8 +323,12 @@ impl Session {
         // record's copy when handoff is enabled (THREAT_MODEL.md).
         let geometry = found.header.geometry;
         let hidden = found.header.position.is_hidden();
-        let device = SharedDevice::new(Box::new(DecryptedDevice::new(dev, xts, &geometry)));
-        let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
+        let truecrypt = found.truecrypt;
+        let device = session_device(
+            Box::new(DecryptedDevice::new(dev, xts, &geometry)),
+            truecrypt,
+        );
+        let vfs = mount(&device, truecrypt)?;
         Ok(Self {
             vfs,
             device,
@@ -310,6 +338,7 @@ impl Session {
             prf: found.prf.name,
             hidden,
             outer_protected: false,
+            truecrypt,
         })
     }
 
@@ -325,6 +354,7 @@ impl Session {
             record.keys = Zeroizing::new(Vec::new());
         }
         let decrypted = DecryptedDevice::new(dev, xts, &record.geometry);
+        let truecrypt = record.truecrypt;
         let (device, latch) = match record.protected {
             Some((start, len)) => {
                 let latch = Arc::new(AtomicBool::new(tripped));
@@ -332,9 +362,9 @@ impl Session {
                     ProtectedDevice::with_latch(Box::new(decrypted), start, len, latch.clone());
                 (SharedDevice::new(Box::new(protected)), Some(latch))
             }
-            None => (SharedDevice::new(Box::new(decrypted)), None),
+            None => (session_device(Box::new(decrypted), truecrypt), None),
         };
-        let vfs = vc_fs::open_volume(Box::new(device.clone()))?;
+        let vfs = mount(&device, truecrypt)?;
         Ok(Self {
             vfs,
             device,
@@ -344,6 +374,7 @@ impl Session {
             outer_protected: latch.is_some(),
             latch,
             record,
+            truecrypt,
         })
     }
 
@@ -370,7 +401,7 @@ impl Session {
         // Its cached metadata predates the other process's writes.
         old.release_without_writing();
         drop(old);
-        self.vfs = vc_fs::open_volume(Box::new(self.device.clone()))?;
+        self.vfs = mount(&self.device, self.truecrypt)?;
         Ok(())
     }
 
@@ -437,6 +468,11 @@ impl Session {
         hidden_passphrase: &[u8],
         progress: &mut UnlockProgress<'_>,
     ) -> VcResult<Self> {
+        // Protection exists to let the outer volume be written; TrueCrypt
+        // volumes never are.
+        if outer_secret.truecrypt {
+            return Err(VcError::TrueCryptReadOnly);
+        }
         // Outer must resolve to a non-hidden slot.
         let outer = find_header_at(
             dev.as_mut(),
@@ -499,6 +535,7 @@ impl Session {
             prf: outer.prf.name,
             hidden: false,
             outer_protected: true,
+            truecrypt: false,
         })
     }
 
@@ -519,6 +556,12 @@ impl Session {
     /// outer unlock reports false and shows nothing (doc §9).
     pub fn is_hidden(&self) -> bool {
         self.hidden
+    }
+
+    /// Whether this volume was opened in TrueCrypt mode (and so is
+    /// read-only).
+    pub fn is_truecrypt(&self) -> bool {
+        self.truecrypt
     }
 
     /// Whether this is the outer volume with hidden-volume protection on

@@ -29,6 +29,10 @@ struct Cli {
     /// PKCS-5 PRF choice; "pbkdf2" tries every hash except Argon2id.
     #[arg(long, global = true, value_enum, default_value_t = KdfArg::Auto)]
     kdf: KdfArg,
+    /// Open TrueCrypt 6.x/7.x volumes (VeraCrypt's "TrueCrypt mode"). They
+    /// open read-only; PIM and --kdf don't apply.
+    #[arg(long, global = true)]
+    truecrypt: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -47,12 +51,14 @@ enum KdfArg {
 }
 
 static KDF: OnceLock<KdfFilter> = OnceLock::new();
+static TRUECRYPT: OnceLock<bool> = OnceLock::new();
 
 /// The unlock secret every command uses: passphrase + PIM under the global
 /// `--kdf` choice.
 fn secret(passphrase: &[u8], pim: u32) -> UnlockSecret<'_> {
     UnlockSecret {
         kdf: KDF.get().copied().unwrap_or_default(),
+        truecrypt: TRUECRYPT.get().copied().unwrap_or(false),
         ..UnlockSecret::new(passphrase, pim)
     }
 }
@@ -548,6 +554,7 @@ fn main() -> ExitCode {
         KdfArg::Whirlpool => KdfFilter::Whirlpool,
         KdfArg::Streebog => KdfFilter::Streebog,
     });
+    let _ = TRUECRYPT.set(cli.truecrypt);
     match cli.command {
         Command::Create {
             container,
