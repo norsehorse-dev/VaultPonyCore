@@ -80,7 +80,12 @@ pub trait Vfs: Send {
     fn truncate(&mut self, path: &str, len: u64) -> VcResult<()>;
     fn flush(&mut self) -> VcResult<()>;
 
+    /// About to be dropped because another process changed the volume: drop
+    /// without writing any cached metadata back (FAT: FSInfo, dirty flag).
+    fn release_without_writing(&mut self) {}
+
     /// Put the file at `src` in place of `dst`, replacing `dst` if it exists.
+    /// A case-only change of the same name is a rename, for folders too.
     /// Used to land a fully written temporary file over the original, so a
     /// writer killed mid-copy leaves the original intact. FAT and exFAT have
     /// no atomic rename-over, so the default removes `dst` and then renames:
@@ -90,6 +95,25 @@ pub trait Vfs: Send {
     /// move. Flushes before returning.
     fn replace(&mut self, src: &str, dst: &str) -> VcResult<()> {
         let src_entry = self.stat(src)?;
+        // The same entry (FAT and exFAT names ignore case): never delete it,
+        // that would delete the source. A case-only change is a rename.
+        let (sp, sn) = split_parent(src);
+        let (dp, dn) = split_parent(dst);
+        if sp == dp && sn.to_lowercase() == dn.to_lowercase() {
+            if sn != dn {
+                // fatfs treats a case-only rename as a no-op, so go through
+                // a temporary name.
+                let parent = if sp == "/" {
+                    String::new()
+                } else {
+                    src[..src.len() - sn.len() - 1].to_string()
+                };
+                let tmp = format!("{parent}/.vaultpony-case-{}.tmp", std::process::id());
+                self.rename(src, &tmp)?;
+                self.rename(&tmp, dst)?;
+            }
+            return self.flush();
+        }
         if src_entry.is_dir {
             return Err(VcError::Filesystem("replace: source is a directory".into()));
         }
@@ -121,6 +145,25 @@ pub trait Vfs: Send {
     /// below anything a container could reach (FAT: 4 GiB - 1).
     fn max_file_bytes(&self) -> Option<u64> {
         None
+    }
+}
+
+/// "/a/b" -> ("/a", "b"), with the parent normalized ("" and "/" are root).
+fn split_parent(path: &str) -> (String, &str) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rfind('/') {
+        Some(i) => {
+            let parent = trimmed[..i].trim_end_matches('/');
+            (
+                if parent.is_empty() {
+                    "/".to_string()
+                } else {
+                    parent.to_lowercase()
+                },
+                &trimmed[i + 1..],
+            )
+        }
+        None => ("/".to_string(), trimmed),
     }
 }
 

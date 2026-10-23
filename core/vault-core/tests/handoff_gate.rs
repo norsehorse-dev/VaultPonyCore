@@ -116,13 +116,20 @@ fn payload(seed: u8, len: usize) -> Vec<u8> {
 /// Decrypt the data area to a plain image and run the platform fsck on it
 /// (skipped when the tool is missing).
 fn fsck(container: &Path, pw: &[u8], fs: ContainerFs) {
+    if let Some((ok, report)) = fsck_report(container, pw, fs) {
+        assert!(ok, "fsck found problems:\n{report}");
+    }
+}
+
+/// fsck's verdict and output; None when the tool is missing.
+fn fsck_report(container: &Path, pw: &[u8], fs: ContainerFs) -> Option<(bool, String)> {
     let tool = match fs {
         ContainerFs::Fat => "fsck.fat",
         ContainerFs::Exfat => "fsck.exfat",
     };
     if Command::new(tool).arg("--help").output().is_err() {
         eprintln!("SKIP fsck: {tool} not installed");
-        return;
+        return None;
     }
     let mut dev = FileDevice::open_read(container).unwrap();
     let found = vc_format::find_header(&mut dev, &secret(pw), &mut |_, _, _| {}).unwrap();
@@ -143,12 +150,14 @@ fn fsck(container: &Path, pw: &[u8], fs: ContainerFs) {
         .output()
         .unwrap();
     std::fs::remove_file(&img_path).ok();
-    assert!(
+    Some((
         out.status.success(),
-        "{tool} found problems:\n{}\n{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+        format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    ))
 }
 
 #[test]
@@ -431,4 +440,123 @@ fn replace_lands_the_temp_file_over_the_original() {
         fsck(&path, PW, fs);
         std::fs::remove_file(&path).ok();
     }
+}
+
+#[test]
+fn replace_onto_the_same_entry_keeps_the_file() {
+    vault_core::enable_handoff(true);
+    for (i, fs) in [ContainerFs::Fat, ContainerFs::Exfat]
+        .into_iter()
+        .enumerate()
+    {
+        let path = make(&format!("same{i}"), "AES", fs);
+        let mut s = unlock(&path, PW);
+        write_file(&mut s, "/Doc.txt", b"keep me");
+        s.replace("/Doc.txt", "/Doc.txt").unwrap();
+        assert_eq!(read_file(&mut s, "/Doc.txt"), b"keep me");
+        s.replace("/Doc.txt", "/doc.TXT").unwrap();
+        assert_eq!(names(&mut s, "/"), vec!["doc.TXT"]);
+        assert_eq!(read_file(&mut s, "/doc.TXT"), b"keep me");
+        s.vfs().mkdir("/photos").unwrap();
+        write_file(&mut s, "/photos/a.jpg", b"jpeg");
+        s.replace("/photos", "/Photos").unwrap();
+        assert_eq!(names(&mut s, "/"), vec!["Photos", "doc.TXT"]);
+        assert_eq!(read_file(&mut s, "/Photos/a.jpg"), b"jpeg");
+        s.lock();
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+/// Without the gate's remount, exFAT's cached bitmap would hand both
+/// sessions the same clusters. The allocator re-checks the disk before
+/// claiming a cluster, so even a missed remount can't cross-link files.
+#[test]
+fn exfat_stale_bitmap_never_double_allocates() {
+    vault_core::enable_handoff(true);
+    let path = make("stale-exfat", "AES", ContainerFs::Exfat);
+    let mut a = unlock(&path, PW);
+    // Load a's bitmap cache now.
+    let _ = a.space().unwrap();
+    let blob = a.export_handoff().unwrap();
+    let mut b = import(&path, &blob).unwrap();
+    let _ = b.space().unwrap();
+    let mut expected = Vec::new();
+    for i in 0..8u8 {
+        let s = if i % 2 == 0 { &mut a } else { &mut b };
+        let name = format!("/f{i}.bin");
+        let data = payload(i, 150_000);
+        s.vfs().create(&name).unwrap();
+        s.vfs().write_at(&name, 0, &data).unwrap();
+        s.vfs().flush().unwrap();
+        expected.push((name, data));
+    }
+    a.lock();
+    b.lock();
+    let mut fresh = unlock(&path, PW);
+    for (n, data) in &expected {
+        if fresh.vfs().stat(n).is_ok() {
+            assert_eq!(&read_file(&mut fresh, n), data, "{n} corrupted");
+        }
+    }
+    fresh.lock();
+    fsck(&path, PW, ContainerFs::Exfat);
+    std::fs::remove_file(&path).ok();
+}
+
+/// FAT32 (fatfs picks it from 512 MiB): FSInfo must stay right with two
+/// sessions, including after a writer was killed without flushing and a
+/// remounting session had recounted free space.
+#[test]
+fn fat32_fsinfo_survives_kill_recount_and_remount() {
+    vault_core::enable_handoff(true);
+    const BIG: u64 = 600 << 20;
+    let path = tmp("fat32");
+    std::fs::File::create(&path).unwrap().set_len(BIG).unwrap();
+    let mut p = params("AES", PW);
+    p.size = BIG;
+    vault_core::create_container(
+        Box::new(FileDevice::open_rw(&path).unwrap()),
+        &p,
+        ContainerFs::Fat,
+    )
+    .unwrap();
+
+    // A writer allocates and dies without flushing.
+    let mut killed = unlock(&path, PW);
+    killed.vfs().create("/orphan.bin").unwrap();
+    killed
+        .vfs()
+        .write_at("/orphan.bin", 0, &payload(1, 400_000))
+        .unwrap();
+    std::mem::forget(killed);
+
+    let mut app = unlock(&path, PW);
+    let _ = app.space().unwrap();
+    let blob = app.export_handoff().unwrap();
+    let mut ext = import(&path, &blob).unwrap();
+    write_file(&mut ext, "/from-ext.bin", &payload(2, 3_000_000));
+    ext.lock();
+    app.remount().unwrap();
+    app.lock();
+    // The killed writer leaves the volume marked dirty, as any crash does,
+    // so fatfs stops trusting FSInfo and leaves it "unknown". What must not
+    // happen is a wrong count, or damage to any file.
+    if let Some((_, report)) = fsck_report(&path, PW, ContainerFs::Fat) {
+        for bad in [
+            "summary wrong",
+            "share clusters",
+            "Truncating",
+            "chain",
+            "Orphaned",
+        ] {
+            assert!(!report.contains(bad), "fsck: {bad}\n{report}");
+        }
+    }
+    let mut fresh = unlock(&path, PW);
+    assert_eq!(
+        read_file(&mut fresh, "/from-ext.bin"),
+        payload(2, 3_000_000)
+    );
+    fresh.lock();
+    std::fs::remove_file(&path).ok();
 }

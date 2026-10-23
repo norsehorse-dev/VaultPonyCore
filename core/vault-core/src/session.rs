@@ -367,7 +367,9 @@ impl Session {
     /// copy, the free-space count) is thrown away. Flush before another
     /// process writes, so nothing stale is pending when this runs.
     pub fn remount(&mut self) -> VcResult<()> {
-        let old = std::mem::replace(&mut self.vfs, Box::new(Unmounted));
+        let mut old = std::mem::replace(&mut self.vfs, Box::new(Unmounted));
+        // Its cached metadata predates the other process's writes.
+        old.release_without_writing();
         drop(old);
         self.vfs = vc_fs::open_volume(Box::new(self.device.clone()))?;
         Ok(())

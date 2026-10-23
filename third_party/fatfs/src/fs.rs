@@ -294,6 +294,8 @@ pub struct FileSystem<T: ReadWriteSeek> {
     total_clusters: u32,
     fs_info: RefCell<FsInfoSector>,
     current_status_flags: Cell<FsStatusFlags>,
+    // VaultPony: set by `release_without_writing`; Drop then writes nothing.
+    released: Cell<bool>,
 }
 
 impl<T: ReadWriteSeek> FileSystem<T> {
@@ -351,6 +353,7 @@ impl<T: ReadWriteSeek> FileSystem<T> {
             total_clusters,
             fs_info: RefCell::new(fs_info),
             current_status_flags: Cell::new(status_flags),
+            released: Cell::new(false),
         })
     }
 
@@ -566,6 +569,13 @@ impl<T: ReadWriteSeek> FileSystem<T> {
     /// consuming it. VaultPony: lets a session publish its metadata at the end
     /// of every logical operation, so a later remount by another process (or a
     /// drop of this one) never writes stale FSInfo over newer state.
+    /// VaultPony: when this filesystem is dropped, write nothing (no FSInfo,
+    /// no dirty flag). For a remount after another process changed the
+    /// volume: whatever this instance holds in memory is stale by then.
+    pub fn release_without_writing(&self) {
+        self.released.set(true);
+    }
+
     pub fn sync_metadata(&self) -> io::Result<()> {
         self.unmount_internal()?;
         self.disk.borrow_mut().flush()
@@ -613,6 +623,9 @@ impl<T: ReadWriteSeek> FileSystem<T> {
 /// `Drop` implementation tries to unmount the filesystem when dropping.
 impl<T: ReadWriteSeek> Drop for FileSystem<T> {
     fn drop(&mut self) {
+        if self.released.get() {
+            return;
+        }
         if let Err(err) = self.unmount_internal() {
             error!("unmount failed {}", err);
         }

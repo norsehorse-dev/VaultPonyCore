@@ -66,35 +66,54 @@ secrets crossing a process boundary, argued here before it ships:
   master keys, volume geometry, the hidden flag, the protected range and
   latch state of an outer-protected session, and a container fingerprint
   (container length plus the 64-byte salt at the header that unlocked).
-  Never the password, PIM or keyfiles. Without them nobody can re-key or
-  open the other volume of a hidden container from the blob.
-- **Where it goes.** Built in the app's memory, passed in one call over the
-  File Provider XPC service the system restricts to VaultPony's own app
-  (`isRestricted`, the default), wiped by the core once parsed. It is never
-  written to disk, the Keychain, logs or an app-group file. The Swift `Data`
-  copy can't be reliably zeroized, the same caveat THREAT_MODEL-IOS records
-  for passphrases; its lifetime is the XPC call.
+  Never the password, PIM or keyfiles.
+- **What a leaked blob means.** The master keys are the volume. Whoever
+  holds the blob can read and write that volume, and can write a new
+  header for it under a password of their choosing; changing the password
+  does not revoke it, because the master keys stay the same. For a hidden
+  container, a blob from the outer volume says nothing about the hidden
+  one and a blob from the hidden volume says nothing about the outer one.
+  So the blob must never leave the two processes, and it doesn't: it is
+  built in the app's memory, passed in one call over the File Provider XPC
+  service, which is restricted to VaultPony's own app and also requires a
+  per-share token from the app group, and parsed by the extension. It is
+  never written to disk, the Keychain, logs or an app-group file.
+- **Copies we can't wipe.** The core wipes its own copies (the session's
+  record, the parsed input). The UniFFI glue copies the blob into and out
+  of RustBuffers that it frees without wiping, Swift `Data` can't be
+  reliably zeroized (THREAT_MODEL-IOS section 2), and XPC keeps its own
+  buffers. These are freed heap memory in two processes that already hold
+  the same keys inside their XTS engines while the vault is open; reading
+  them takes the process-memory access that is out of scope below.
 - **Key copies at rest in memory.** A session normally keeps master keys
   only inside the XTS engine. A process that calls `enable_handoff(true)`
-  (only the iOS app) keeps one more `Zeroizing` copy per session so it can
-  export again later; the expanded cipher keys in the engine already reveal
-  the same secret to anyone who can read process memory, so this adds no
-  new class of exposure. Locking drops and wipes it on the same single path.
-  Android and desktop never enable it.
+  keeps one more `Zeroizing` copy per session so it can export again
+  later. The iOS app turns it on only for an unlock with "Show in Files";
+  Android and desktop never do. Locking a session wipes its copy on the
+  same single path. Each process locks its own session: the shells tell
+  the extension to lock whenever the app locks or its auto-lock comes due,
+  and the extension also enforces the deadline itself (THREAT_MODEL-IOS 9).
 - **Wrong file.** Import checks the fingerprint against the fd it was given
   and refuses any other file, including the same file after a password
-  change (new salt), with the ordinary `NotFoundOrWrongPassword`.
+  change (new salt), with the ordinary `NotFoundOrWrongPassword`. This is
+  a correctness check against applying keys to the wrong container, not a
+  security control.
 - **Hidden volumes.** A blob from a hidden-volume session says "hidden", so
   it is exactly as revealing as the open session it came from, and lives
   only in the two processes that already hold that session. Shells keep the
   rule above: nothing persistent or system-visible names the volume type.
+  Hidden-volume protection latches per session; each process still blocks
+  every write into the protected range, and the iOS shells share a trip
+  through their gate file so both stop writing, as VeraCrypt does.
 - **Two writers.** The app and the extension then hold two mounts of one
   volume. They take a cross-process lock per operation, flush at the end of
-  each, and `remount()` (which discards every cached allocation state) when
-  the other side wrote in between. `vault-core/tests/handoff_gate.rs` runs
-  interleaved writers through FAT and exFAT and checks the result with a
-  fresh unlock and `fsck`; skipping the remount there corrupts files, which
-  is why the shells must never skip it.
+  each, and `remount()` (which discards every cached allocation state
+  without writing any of it back) when the other side wrote in between.
+  `vault-core/tests/handoff_gate.rs` runs interleaved writers through FAT,
+  FAT32 and exFAT and checks the result with a fresh unlock and `fsck`.
+  As a backstop, the exFAT allocator re-reads the on-disk bitmap before
+  claiming a cluster, so a missed remount can't hand two files the same
+  cluster; the shells still must not skip the remount.
 
 ### No network attack surface
 

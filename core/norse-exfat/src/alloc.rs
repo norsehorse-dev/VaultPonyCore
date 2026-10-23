@@ -72,12 +72,13 @@ impl BitmapCache {
         self.bytes.as_ref().map(|_| self.free)
     }
 
-    fn get(&self, cluster: u32) -> Option<bool> {
-        let bit = (cluster - 2) as usize;
-        self.bytes
-            .as_ref()
-            .and_then(|b| b.get(bit / 8))
-            .map(|byte| byte & (1 << (bit % 8)) != 0)
+    /// Forget the cached copy; the next use reloads it from disk. Used when
+    /// the disk shows a cluster the cache thought free is taken: another
+    /// session on the same volume allocated it (a File Provider extension
+    /// next to the app, rc3).
+    pub(crate) fn invalidate(&mut self) {
+        self.bytes = None;
+        self.free = 0;
     }
 
     fn set(&mut self, cluster: u32, allocated: bool) {
@@ -165,25 +166,6 @@ fn bitmap_byte_offset(geo: &Geometry, bm: &BitmapLoc, cluster: u32) -> ExfatResu
     Ok(geo.cluster_offset(bm.first_cluster)? + byte_index)
 }
 
-pub(crate) fn is_allocated<D: WriteAt>(
-    disk: &mut D,
-    geo: &Geometry,
-    bm: &BitmapLoc,
-    cache: &BitmapCache,
-    cluster: u32,
-) -> ExfatResult<bool> {
-    if cluster < 2 || cluster >= geo.cluster_count + 2 {
-        return Err(ExfatError::Invalid("bitmap index out of range"));
-    }
-    if let Some(v) = cache.get(cluster) {
-        return Ok(v);
-    }
-    let off = bitmap_byte_offset(geo, bm, cluster)?;
-    let mut b = [0u8; 1];
-    disk.read_at(off, &mut b)?;
-    Ok(b[0] & (1 << ((cluster - 2) % 8)) != 0)
-}
-
 fn set_bit<D: WriteAt>(
     disk: &mut D,
     geo: &Geometry,
@@ -242,13 +224,56 @@ fn find_free<D: WriteAt>(
         }
         return Err(ExfatError::Invalid("no free clusters"));
     }
-    for i in 0..total {
-        let cluster = 2 + ((start + i) % total);
-        if !is_allocated(disk, geo, bm, cache, cluster)? {
-            return Ok(cluster);
+    // Uncached (bitmap above the cache cap, e.g. the low-memory profile):
+    // scan the on-disk bitmap in chunks rather than a read per cluster.
+    const CHUNK: u32 = 64 * 1024;
+    for (a, b) in [(start, total), (0, start)] {
+        let mut bit = a - a % 8;
+        while bit < b {
+            let span = (b - bit).div_ceil(8).min(CHUNK);
+            let mut buf = vec![0u8; span as usize];
+            disk.read_at(bitmap_byte_offset(geo, bm, bit + 2)?, &mut buf)?;
+            for (i, byte) in buf.iter().enumerate() {
+                if *byte == 0xff {
+                    continue;
+                }
+                for k in 0..8u32 {
+                    let candidate = bit + i as u32 * 8 + k;
+                    if candidate < a.max(bit) || candidate >= b {
+                        continue;
+                    }
+                    if byte & (1 << k) == 0 {
+                        return Ok(candidate + 2);
+                    }
+                }
+            }
+            bit += span * 8;
         }
     }
     Err(ExfatError::Invalid("no free clusters"))
+}
+
+/// Mark `cluster` allocated, unless the disk already has it allocated:
+/// then the caller's view of free space is stale (another session wrote).
+/// Returns whether the cluster was claimed.
+fn claim_bit<D: WriteAt>(
+    disk: &mut D,
+    geo: &Geometry,
+    bm: &BitmapLoc,
+    cache: &mut BitmapCache,
+    cluster: u32,
+) -> ExfatResult<bool> {
+    let off = bitmap_byte_offset(geo, bm, cluster)?;
+    let mut b = [0u8; 1];
+    disk.read_at(off, &mut b)?;
+    let mask = 1u8 << ((cluster - 2) % 8);
+    if b[0] & mask != 0 {
+        return Ok(false);
+    }
+    b[0] |= mask;
+    disk.write_at(off, &b)?;
+    cache.set(cluster, true);
+    Ok(true)
 }
 
 /// Allocate `count` clusters as a FAT chain (not necessarily contiguous),
@@ -265,8 +290,23 @@ pub(crate) fn alloc_chain<D: WriteAt>(
     let mut chain = Vec::with_capacity(count as usize);
     let mut hint = 2;
     for _ in 0..count {
-        let c = find_free(disk, geo, bm, cache, hint)?;
-        set_bit(disk, geo, bm, cache, c, true)?;
+        // The disk has the last word: a cluster the cache offers that is
+        // taken on disk means the cache is stale. Reload and look again
+        // rather than cross-link two files.
+        let mut stale = 0u32;
+        let c = loop {
+            let c = find_free(disk, geo, bm, cache, hint)?;
+            if claim_bit(disk, geo, bm, cache, c)? {
+                break c;
+            }
+            cache.invalidate();
+            stale += 1;
+            if stale > 2 {
+                return Err(ExfatError::Invalid(
+                    "allocation bitmap changed during allocation",
+                ));
+            }
+        };
         chain.push(c);
         hint = c + 1;
     }

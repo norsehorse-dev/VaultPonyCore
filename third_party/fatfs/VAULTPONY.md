@@ -37,6 +37,12 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    power-loss harness with fsck at every cut
    (`VAULTPONY_FULL_POWERLOSS=1`).
 
+5. `src/fs.rs`: new public `FileSystem::release_without_writing()`. After
+   it, dropping the filesystem writes nothing (no FSInfo, no dirty flag).
+   Used when a session remounts because another process changed the volume:
+   the old instance's cached FSInfo is stale by then and must not overwrite
+   the other process's.
+
 ## Removal condition
 
 Delete this directory and the `[patch.crates-io]` entry when a fatfs

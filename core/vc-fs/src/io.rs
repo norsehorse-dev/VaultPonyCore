@@ -8,12 +8,21 @@ pub struct DeviceIo {
     dev: Box<dyn BlockDevice>,
     pos: u64,
     len: u64,
+    /// Written since the last flush. A flush with nothing written is a
+    /// no-op, so read-only sessions never ask the OS to sync (Windows
+    /// refuses FlushFileBuffers on a read-only handle).
+    dirty: bool,
 }
 
 impl DeviceIo {
     pub fn new(mut dev: Box<dyn BlockDevice>) -> vc_types::VcResult<Self> {
         let len = dev.len()?;
-        Ok(Self { dev, pos: 0, len })
+        Ok(Self {
+            dev,
+            pos: 0,
+            len,
+            dirty: false,
+        })
     }
 }
 
@@ -39,13 +48,19 @@ impl Read for DeviceIo {
 
 impl Write for DeviceIo {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.dirty = true;
         self.dev.write_at(self.pos, buf).map_err(to_io)?;
         self.pos += buf.len() as u64;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.dev.flush().map_err(to_io)
+        if !self.dirty {
+            return Ok(());
+        }
+        self.dev.flush().map_err(to_io)?;
+        self.dirty = false;
+        Ok(())
     }
 }
 

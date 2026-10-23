@@ -640,8 +640,10 @@ impl VaultSession {
     /// called before this session was unlocked.
     pub fn export_handoff(&self) -> FfiResult<Vec<u8>> {
         with_session(&self.inner, |s| {
-            let blob = s.export_handoff()?;
-            Ok(blob.to_vec())
+            let mut blob = s.export_handoff()?;
+            // UniFFI copies this into a RustBuffer and frees both without
+            // wiping them; THREAT_MODEL.md (key handoff) accounts for it.
+            Ok(std::mem::take(&mut *blob))
         })
     }
 

@@ -238,6 +238,10 @@ impl Vfs for FatVfs {
         Some(FAT_MAX_FILE_BYTES)
     }
 
+    fn release_without_writing(&mut self) {
+        self.fs.release_without_writing();
+    }
+
     fn flush(&mut self) -> VcResult<()> {
         // Per-file data is flushed at each op above. Publish FSInfo and clear
         // the dirty flag now rather than only at unmount: with two sessions on
