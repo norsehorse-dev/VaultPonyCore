@@ -195,6 +195,35 @@ fn secret<'a>(
         kdf: kdf.into(),
         cancel: cancel.as_deref().map(|c| &c.flag),
         truecrypt: false,
+        legacy_passphrase: None,
+    }
+}
+
+/// The effective secret plus, for keyfiles with a passphrase over 64 bytes,
+/// the VaultPony 1.x mix to fall back on (`vc_crypto::apply_keyfiles_legacy`).
+struct Mixed {
+    secret: Zeroizing<Vec<u8>>,
+    legacy: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl Mixed {
+    fn new(passphrase: &[u8], keyfiles: &[Vec<u8>]) -> Self {
+        Self {
+            secret: vc_crypto::apply_keyfiles(passphrase, keyfiles),
+            legacy: vc_crypto::apply_keyfiles_legacy(passphrase, keyfiles),
+        }
+    }
+
+    fn unlock<'a>(
+        &'a self,
+        pim: u32,
+        kdf: KdfFilter,
+        cancel: &'a Option<Arc<UnlockCancel>>,
+    ) -> vault_core::UnlockSecret<'a> {
+        vault_core::UnlockSecret {
+            legacy_passphrase: self.legacy.as_deref().map(|v| v.as_slice()),
+            ..secret(&self.secret, pim, kdf, cancel)
+        }
     }
 }
 
@@ -362,7 +391,7 @@ pub fn restore_header_from_file(
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
     vc_crypto::check_keyfiles(&keyfiles)?;
-    let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+    let effective = Mixed::new(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
     }
@@ -370,7 +399,7 @@ pub fn restore_header_from_file(
     vault_core::restore_header_from_file_with(
         &mut dev,
         &backup,
-        &secret(&effective, pim, kdf, &cancel),
+        &effective.unlock(pim, kdf, &cancel),
     )?;
     Ok(())
 }
@@ -389,15 +418,12 @@ pub fn restore_header_from_embedded(
     let passphrase = Zeroizing::new(passphrase);
     let mut keyfiles = keyfiles;
     vc_crypto::check_keyfiles(&keyfiles)?;
-    let effective = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+    let effective = Mixed::new(passphrase.as_bytes(), &keyfiles);
     for kf in &mut keyfiles {
         kf.zeroize();
     }
     let mut dev = unsafe { vc_io::RawFdDevice::from_raw_fd(fd) };
-    vault_core::restore_header_from_embedded_with(
-        &mut dev,
-        &secret(&effective, pim, kdf, &cancel),
-    )?;
+    vault_core::restore_header_from_embedded_with(&mut dev, &effective.unlock(pim, kdf, &cancel))?;
     Ok(())
 }
 
@@ -426,7 +452,7 @@ pub fn change_password(
     let mut new_keyfiles = new_keyfiles;
     vc_crypto::check_keyfiles(&old_keyfiles)?;
     vc_crypto::check_keyfiles(&new_keyfiles)?;
-    let old_secret = vc_crypto::apply_keyfiles(old_passphrase.as_bytes(), &old_keyfiles);
+    let old_secret = Mixed::new(old_passphrase.as_bytes(), &old_keyfiles);
     let new_secret = vc_crypto::apply_keyfiles(new_passphrase.as_bytes(), &new_keyfiles);
     for kf in old_keyfiles.iter_mut().chain(new_keyfiles.iter_mut()) {
         kf.zeroize();
@@ -444,7 +470,7 @@ pub fn change_password(
     };
     vault_core::change_password_to(
         &mut dev,
-        &secret(&old_secret, old_pim, kdf, &cancel),
+        &old_secret.unlock(old_pim, kdf, &cancel),
         &vault_core::UnlockSecret::new(&new_secret, new_pim),
         new_prf,
         new_passphrase.as_bytes(),
@@ -720,7 +746,7 @@ impl VaultSession {
         // we wipe the raw keyfile bytes as soon as they've been mixed in.
         let mut keyfiles = keyfiles;
         vc_crypto::check_keyfiles(&keyfiles)?;
-        let secret = vc_crypto::apply_keyfiles(passphrase.as_bytes(), &keyfiles);
+        let secret = Mixed::new(passphrase.as_bytes(), &keyfiles);
         for kf in &mut keyfiles {
             kf.zeroize();
         }
@@ -733,7 +759,7 @@ impl VaultSession {
         };
         let session = vault_core::Session::unlock_device_with(
             Box::new(dev),
-            &self::secret(&secret, pim, kdf, &cancel),
+            &secret.unlock(pim, kdf, &cancel),
             &mut progress,
         )?;
         Ok(std::sync::Arc::new(Self {
@@ -1460,6 +1486,98 @@ mod tests {
         assert_eq!(&data, b"survive");
         s.lock();
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn a_1x_long_password_keyfile_vault_opens_and_migrates() {
+        // VaultPony 1.x mixed keyfiles into a 64-byte pool for every
+        // passphrase. Make such a vault (its mixed secret as the passphrase,
+        // no keyfiles), then open it the way the apps do.
+        let tmp = std::env::temp_dir().join("vaultpony-ffi-keyfile-legacy.vc");
+        let size: u64 = 8 << 20;
+        let pw = "a passphrase that is well over sixty-four bytes long, as 1.x allowed it";
+        let kf = vec![(0..200u32).map(|i| (i * 7 + 3) as u8).collect::<Vec<u8>>()];
+        let legacy = vc_crypto::apply_keyfiles_legacy(pw.as_bytes(), &kf).unwrap();
+        {
+            let f = std::fs::File::create(&tmp).unwrap();
+            f.set_len(size).unwrap();
+        }
+        vault_core::create_container(
+            Box::new(vc_io::FileDevice::open_rw(&tmp).unwrap()),
+            &vault_core::CreateParams {
+                scheme: vc_types::registry::ENCRYPTION_SCHEMES
+                    .iter()
+                    .find(|s| s.name == "AES")
+                    .unwrap(),
+                prf: vc_types::registry::PRFS
+                    .iter()
+                    .find(|p| p.name == "SHA-512")
+                    .unwrap(),
+                pim: 0,
+                passphrase: &legacy,
+                keyfiles: &[],
+                size,
+                sector_size: 512,
+            },
+            vault_core::ContainerFs::Fat,
+        )
+        .unwrap();
+        let open = |write: bool| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(write)
+                .open(&tmp)
+                .unwrap()
+                .into_raw_fd()
+        };
+        let s = VaultSession::unlock_fd(
+            open(true),
+            pw.into(),
+            0,
+            kf.clone(),
+            KdfFilter::Sha512,
+            None,
+            None,
+        )
+        .unwrap();
+        s.create("/keep.txt".into()).unwrap();
+        s.write_at("/keep.txt".into(), 0, b"survive".to_vec())
+            .unwrap();
+        s.flush().unwrap();
+        s.lock();
+
+        // Change Password with the same password and keyfiles.
+        change_password(
+            open(true),
+            pw.into(),
+            0,
+            kf.clone(),
+            pw.into(),
+            0,
+            kf.clone(),
+            None,
+            KdfFilter::Sha512,
+            None,
+        )
+        .unwrap();
+
+        // Now the VeraCrypt mix alone opens it, which is what VeraCrypt uses.
+        let modern = vc_crypto::apply_keyfiles(pw.as_bytes(), &kf);
+        vault_core::probe_with(
+            &tmp,
+            &vault_core::UnlockSecret {
+                kdf: vc_types::KdfFilter::for_prf("SHA-512").unwrap(),
+                ..vault_core::UnlockSecret::new(&modern, 0)
+            },
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        let s =
+            VaultSession::unlock_fd(open(false), pw.into(), 0, kf, KdfFilter::Sha512, None, None)
+                .unwrap();
+        assert_eq!(&s.read_at("/keep.txt".into(), 0, 64).unwrap(), b"survive");
+        s.lock();
         let _ = std::fs::remove_file(&tmp);
     }
 

@@ -208,9 +208,24 @@ fn read_keyfiles(paths: &[PathBuf]) -> Result<Vec<Vec<u8>>, ExitCode> {
         .collect()
 }
 
-/// Read the passphrase and fold in any keyfiles → the effective secret fed
-/// to the core (doc §4). Wiped on drop.
-fn effective_secret(keyfiles: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>, ExitCode> {
+/// The effective secret fed to the core (doc §4), plus the VaultPony 1.x
+/// keyfile mix to fall back on when it differs. Wiped on drop.
+struct Mixed {
+    secret: Zeroizing<Vec<u8>>,
+    legacy: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl Mixed {
+    fn unlock(&self, pim: u32) -> UnlockSecret<'_> {
+        UnlockSecret {
+            legacy_passphrase: self.legacy.as_deref().map(|v| v.as_slice()),
+            ..secret(&self.secret, pim)
+        }
+    }
+}
+
+/// Read the passphrase and fold in any keyfiles.
+fn effective_secret(keyfiles: &[PathBuf]) -> Result<Mixed, ExitCode> {
     let passphrase = read_passphrase().map_err(|e| {
         eprintln!("error: {e}");
         ExitCode::FAILURE
@@ -220,7 +235,10 @@ fn effective_secret(keyfiles: &[PathBuf]) -> Result<Zeroizing<Vec<u8>>, ExitCode
         eprintln!("error: {e}");
         return Err(ExitCode::FAILURE);
     }
-    Ok(vc_crypto::apply_keyfiles(passphrase.as_bytes(), &kf))
+    Ok(Mixed {
+        secret: vc_crypto::apply_keyfiles(passphrase.as_bytes(), &kf),
+        legacy: vc_crypto::apply_keyfiles_legacy(passphrase.as_bytes(), &kf),
+    })
 }
 
 fn cmd_info(container: PathBuf, pim: u32, keyfiles: Vec<PathBuf>) -> ExitCode {
@@ -229,14 +247,13 @@ fn cmd_info(container: PathBuf, pim: u32, keyfiles: Vec<PathBuf>) -> ExitCode {
         Err(code) => return code,
     };
     let mut last = String::new();
-    let result =
-        vault_core::probe_with(&container, &self::secret(&secret, pim), &mut |i, n, prf| {
-            if std::io::stderr().is_terminal() {
-                last = format!("trying {prf} ({}/{n})...", i + 1);
-                eprint!("\r{last}");
-                let _ = std::io::stderr().flush();
-            }
-        });
+    let result = vault_core::probe_with(&container, &secret.unlock(pim), &mut |i, n, prf| {
+        if std::io::stderr().is_terminal() {
+            last = format!("trying {prf} ({}/{n})...", i + 1);
+            eprint!("\r{last}");
+            let _ = std::io::stderr().flush();
+        }
+    });
     if !last.is_empty() {
         eprintln!();
     }
@@ -290,7 +307,7 @@ fn unlock_mode(
     let session = dev.and_then(|dev| {
         vault_core::Session::unlock_device_with(
             Box::new(dev),
-            &self::secret(&secret, pim),
+            &secret.unlock(pim),
             &mut |i, n, prf| {
                 if std::io::stderr().is_terminal() {
                     last = format!("trying {prf} ({}/{n})...", i + 1);
@@ -402,7 +419,7 @@ fn unlock_protected(
         .and_then(|dev| {
             vault_core::Session::unlock_outer_protected_device_with(
                 Box::new(dev),
-                &secret(&outer, pim),
+                &outer.unlock(pim),
                 hidden.as_bytes(),
                 &mut |_, _, _| {},
             )

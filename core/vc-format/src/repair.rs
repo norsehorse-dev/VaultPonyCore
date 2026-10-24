@@ -154,8 +154,15 @@ pub fn change_password_to(
     dev.read_at(matched_off, &mut salt)?;
     let mut plaintext = [0u8; consts::HEADER_ENC_LEN];
     dev.read_at(matched_off + consts::SALT_LEN as u64, &mut plaintext)?;
+    // A VaultPony 1.x keyfile mix matched: re-derive with that secret. The
+    // new header below always uses the VeraCrypt mix, which is how changing
+    // the password (even to the same one) makes such a vault VeraCrypt-ready.
+    let old_passphrase = match (found.legacy_keyfile_mix, old.legacy_passphrase) {
+        (true, Some(legacy)) => legacy,
+        _ => old.passphrase,
+    };
     let old_key =
-        vc_crypto::derive_header_key_for(prf, old.passphrase, &salt, old.pim, scheme.key_bytes())?;
+        vc_crypto::derive_header_key_for(prf, old_passphrase, &salt, old.pim, scheme.key_bytes())?;
     let xts_old = vc_crypto::SchemeXts::new(scheme, old_key.as_bytes())?;
     xts_old.decrypt_header(&mut plaintext);
     // Confirm the recovered plaintext really is this volume's header.

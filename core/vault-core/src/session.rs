@@ -487,6 +487,7 @@ impl Session {
             dev.as_mut(),
             &UnlockSecret {
                 passphrase: hidden_passphrase,
+                legacy_passphrase: None,
                 ..*outer_secret
             },
             &[HeaderPosition::Hidden, HeaderPosition::BackupHidden],

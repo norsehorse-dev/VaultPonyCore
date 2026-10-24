@@ -64,14 +64,33 @@ fn mix_into_pool(pool: &mut [u8], write_pos: &mut usize, crc: &mut u32, data: &[
 /// bytes, extending the length to the pool size when shorter. Callers check
 /// for empty keyfiles first (`check_keyfiles`).
 pub fn apply_keyfiles(passphrase: &[u8], keyfiles: &[Vec<u8>]) -> Zeroizing<Vec<u8>> {
-    if keyfiles.is_empty() {
-        return Zeroizing::new(passphrase.to_vec());
-    }
     let pool_size = if passphrase.len() <= MAX_LEGACY_PASSWORD {
         POOL_SIZE
     } else {
         POOL_SIZE_LONG
     };
+    mix(passphrase, keyfiles, pool_size)
+}
+
+/// The secret VaultPony 1.x derived for the same input, when it differs
+/// from [`apply_keyfiles`]: 1.x always used the 64-byte pool, so a vault it
+/// made with keyfiles and a passphrase longer than 64 bytes only opens with
+/// this secret (and never opened in VeraCrypt). `None` for every other
+/// input, so ordinary unlocks never try a second secret. Unlock code tries
+/// this only after the VeraCrypt secret fails; changing the password then
+/// rewrites the header with the VeraCrypt mix.
+pub fn apply_keyfiles_legacy(
+    passphrase: &[u8],
+    keyfiles: &[Vec<u8>],
+) -> Option<Zeroizing<Vec<u8>>> {
+    (!keyfiles.is_empty() && passphrase.len() > MAX_LEGACY_PASSWORD)
+        .then(|| mix(passphrase, keyfiles, POOL_SIZE))
+}
+
+fn mix(passphrase: &[u8], keyfiles: &[Vec<u8>], pool_size: usize) -> Zeroizing<Vec<u8>> {
+    if keyfiles.is_empty() {
+        return Zeroizing::new(passphrase.to_vec());
+    }
     let mut pool = Zeroizing::new(vec![0u8; pool_size]);
     for kf in keyfiles {
         let mut write_pos = 0usize;
@@ -113,6 +132,21 @@ mod tests {
         assert!(out[65..].iter().any(|&b| b != 0));
         let short = apply_keyfiles(&[b'a'; 64], &[vec![0xABu8; 100]]);
         assert_eq!(short.len(), POOL_SIZE);
+    }
+
+    #[test]
+    fn legacy_secret_only_for_long_passphrases_with_keyfiles() {
+        let kf = [vec![0xABu8; 100]];
+        assert!(apply_keyfiles_legacy(&[b'a'; 64], &kf).is_none());
+        assert!(apply_keyfiles_legacy(&[b'a'; 65], &[]).is_none());
+        let pw = [b'a'; 65];
+        let legacy = apply_keyfiles_legacy(&pw, &kf).unwrap();
+        // 1.x: 64-byte pool, so the passphrase keeps its length and bytes
+        // past 64 are untouched.
+        assert_eq!(legacy.len(), 65);
+        assert_eq!(legacy[64], b'a');
+        assert_ne!(&legacy[..], &apply_keyfiles(&pw, &kf)[..]);
+        assert_eq!(&legacy[..64], &apply_keyfiles(&pw[..64], &kf)[..64]);
     }
 
     #[test]

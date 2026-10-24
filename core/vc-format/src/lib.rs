@@ -38,6 +38,12 @@ pub struct UnlockSecret<'a> {
     /// ignored (TrueCrypt has neither). Off for every VeraCrypt unlock, so
     /// ordinary unlocks never pay for the extra derivations.
     pub truecrypt: bool,
+    /// The VaultPony 1.x keyfile mix of the same input
+    /// (`vc_crypto::apply_keyfiles_legacy`), tried only after `passphrase`
+    /// finds nothing. Set only when keyfiles are used with a passphrase over
+    /// 64 bytes, so the extra sweep is paid only by those inputs, and its
+    /// cost depends on what the user typed, never on the container.
+    pub legacy_passphrase: Option<&'a [u8]>,
 }
 
 impl<'a> UnlockSecret<'a> {
@@ -49,6 +55,7 @@ impl<'a> UnlockSecret<'a> {
             kdf: KdfFilter::Auto,
             cancel: None,
             truecrypt: false,
+            legacy_passphrase: None,
         }
     }
 
@@ -92,6 +99,10 @@ pub struct FoundHeader {
     pub prf: &'static vc_types::Prf,
     /// A TrueCrypt header (TrueCrypt mode). Such volumes open read-only.
     pub truecrypt: bool,
+    /// Unlocked with `UnlockSecret::legacy_passphrase`: a VaultPony 1.x
+    /// keyfile mix that VeraCrypt cannot open. Changing the password (the
+    /// same one works) rewrites the header with the VeraCrypt mix.
+    pub legacy_keyfile_mix: bool,
 }
 
 /// Search for a header that validates. The supplied password alone decides
@@ -133,7 +144,41 @@ pub fn find_header(
 
 /// `find_header` with an explicit position list — the repair tooling probes
 /// single positions (e.g. only the embedded backup) through this.
+///
+/// When the secret carries a `legacy_passphrase`, a full miss with the
+/// VeraCrypt mix is followed by the same search with the 1.x mix. Progress
+/// then counts both sweeps from the start, so the bar never runs backwards.
 pub fn find_header_at(
+    container: &mut dyn vc_io::BlockDevice,
+    secret: &UnlockSecret<'_>,
+    positions: &[HeaderPosition],
+    progress: &mut UnlockProgress<'_>,
+) -> VcResult<FoundHeader> {
+    let Some(legacy) = secret.legacy_passphrase else {
+        return search(container, secret, positions, progress);
+    };
+    let mut done = 0usize;
+    let first = search(container, secret, positions, &mut |i, n, prf| {
+        done = n;
+        progress(i, n * 2, prf)
+    });
+    match first {
+        Err(VcError::NotFoundOrWrongPassword) => {}
+        other => return other,
+    }
+    let legacy_secret = UnlockSecret {
+        passphrase: legacy,
+        legacy_passphrase: None,
+        ..*secret
+    };
+    let mut found = search(container, &legacy_secret, positions, &mut |i, n, prf| {
+        progress(done + i, done + n, prf)
+    })?;
+    found.legacy_keyfile_mix = true;
+    Ok(found)
+}
+
+fn search(
     container: &mut dyn vc_io::BlockDevice,
     secret: &UnlockSecret<'_>,
     positions: &[HeaderPosition],
@@ -217,6 +262,7 @@ pub fn find_header_at(
                         scheme,
                         prf: default_prf,
                         truecrypt,
+                        legacy_keyfile_mix: false,
                     })
                 }
                 SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -252,6 +298,7 @@ pub fn find_header_at(
                             scheme,
                             prf: default_prf,
                             truecrypt,
+                            legacy_keyfile_mix: false,
                         })
                     }
                     SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -292,6 +339,7 @@ pub fn find_header_at(
                             scheme,
                             prf,
                             truecrypt,
+                            legacy_keyfile_mix: false,
                         })
                     }
                     SchemeOutcome::Finding(e) => best_finding = Some(e),
@@ -317,6 +365,7 @@ pub fn find_header_at(
                         scheme,
                         prf,
                         truecrypt,
+                        legacy_keyfile_mix: false,
                     })
                 }
                 SchemeOutcome::Finding(e) => best_finding = Some(e),

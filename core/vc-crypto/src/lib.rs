@@ -13,5 +13,5 @@ pub use kdf::{
     derive_argon2id, derive_header_key, derive_header_key_for, derive_truecrypt_header_key,
     Argon2Memory, HeaderKey,
 };
-pub use keyfile::{apply_keyfiles, check_keyfiles};
+pub use keyfile::{apply_keyfiles, apply_keyfiles_legacy, check_keyfiles};
 pub use xts::SchemeXts;
