@@ -272,7 +272,7 @@ impl<'a, T: ReadWriteSeek> Write for File<'a, T> {
                     // directory is the one file without an entry of its own, so
                     // is_dir() is false for it. Its new clusters must be zeroed
                     // like any directory's.
-                    let zero = self.is_dir() || self.entry.is_none();
+                    let zero = self.is_dir() || (self.entry.is_none() && !self.fs.options.legacy_unzeroed_root);
                     let new_cluster = self.fs.alloc_cluster(self.current_cluster, zero)?;
                     trace!("allocated cluser {}", new_cluster);
                     if self.first_cluster.is_none() {

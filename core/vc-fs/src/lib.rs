@@ -8,6 +8,7 @@ pub mod detect;
 pub mod exfat;
 pub mod ext4;
 pub mod fat;
+pub mod fat_repair;
 pub mod io;
 pub mod ntfs_ro;
 
@@ -84,6 +85,12 @@ pub trait Vfs: Send {
     /// About to be dropped because another process changed the volume: drop
     /// without writing any cached metadata back (FAT: FSInfo, dirty flag).
     fn release_without_writing(&mut self) {}
+
+    /// What the mount-time repair of an old FAT32 top folder did, handed
+    /// over once (see [`fat_repair`]). None when nothing was repaired.
+    fn take_repair_report(&mut self) -> Option<fat_repair::RepairReport> {
+        None
+    }
 
     /// Put the file at `src` in place of `dst`, replacing `dst` if it exists.
     /// A case-only change of the same name is a rename, for folders too.
@@ -187,7 +194,12 @@ pub fn open_volume(mut dev: Box<dyn vc_io::BlockDevice>) -> VcResult<Box<dyn Vfs
     let mut boot = [0u8; 4096];
     dev.read_at(0, &mut boot)?;
     match detect::sniff(&boot) {
-        FsKind::Fat => Ok(Box::new(fat::FatVfs::open(io::DeviceIo::new(dev)?)?)),
+        FsKind::Fat => {
+            let repair = fat_repair::repair_root(dev.as_mut());
+            let mut vfs = fat::FatVfs::open(io::DeviceIo::new(dev)?)?;
+            vfs.set_repair_report(repair);
+            Ok(Box::new(vfs))
+        }
         FsKind::Exfat => Ok(Box::new(exfat::ExfatVfs::open(dev)?)),
         FsKind::Ntfs => Ok(Box::new(ntfs_ro::NtfsVfs::open(dev)?)),
         FsKind::Ext4 => Ok(Box::new(ext4::Ext4Vfs::open(dev)?)),

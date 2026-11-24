@@ -225,6 +225,7 @@ pub struct FsOptions {
     pub(crate) update_accessed_date: bool,
     pub(crate) oem_cp_converter: &'static OemCpConverter,
     pub(crate) time_provider: &'static TimeProvider,
+    pub(crate) legacy_unzeroed_root: bool,
 }
 
 impl FsOptions {
@@ -234,7 +235,17 @@ impl FsOptions {
             update_accessed_date: false,
             oem_cp_converter: &LOSSY_OEM_CP_CONVERTER,
             time_provider: &DEFAULT_TIME_PROVIDER,
+            legacy_unzeroed_root: false,
         }
+    }
+
+    /// Grow the FAT32 root directory the way stock 0.3.6 did, without
+    /// zeroing its new clusters. Only for tests that need a volume damaged
+    /// the old way (VaultPony local change, see VAULTPONY.md, 6).
+    #[doc(hidden)]
+    pub fn legacy_unzeroed_root(mut self, enabled: bool) -> Self {
+        self.legacy_unzeroed_root = enabled;
+        self
     }
 
     /// If enabled accessed date field in directory entry is updated when reading or writing a file.

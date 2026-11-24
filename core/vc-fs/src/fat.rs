@@ -11,6 +11,8 @@ pub struct FatVfs {
     /// Set once the free count has been recounted from the FAT this session;
     /// after that fatfs keeps it exact on every allocate and free.
     free_counted: bool,
+    /// From the mount-time top folder repair, until someone asks for it.
+    repair: Option<crate::fat_repair::RepairReport>,
 }
 
 // SAFETY: `fatfs::FileSystem` fails auto-Send only because `FsOptions`
@@ -30,7 +32,12 @@ impl FatVfs {
         Ok(Self {
             fs,
             free_counted: false,
+            repair: None,
         })
+    }
+
+    pub(crate) fn set_repair_report(&mut self, report: Option<crate::fat_repair::RepairReport>) {
+        self.repair = report;
     }
 }
 
@@ -240,6 +247,10 @@ impl Vfs for FatVfs {
 
     fn release_without_writing(&mut self) {
         self.fs.release_without_writing();
+    }
+
+    fn take_repair_report(&mut self) -> Option<crate::fat_repair::RepairReport> {
+        self.repair.take()
     }
 
     fn flush(&mut self) -> VcResult<()> {

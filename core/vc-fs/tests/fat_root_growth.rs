@@ -105,7 +105,11 @@ fn assert_only_ours(vfs: &mut dyn Vfs, dir: &str, files: usize) {
         .collect();
     names.sort();
     let expected: Vec<String> = (0..files).map(name).collect();
-    assert_eq!(names.len(), files, "the listing holds entries nobody created");
+    assert_eq!(
+        names.len(),
+        files,
+        "the listing holds entries nobody created"
+    );
     assert_eq!(names, expected);
 }
 

@@ -53,6 +53,10 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    run of entries. Subdirectories and FAT12/16 roots (a fixed area) were
    never affected. Found while measuring import speed for 2.1.0; regression
    test in core/vc-fs/tests/fat_root_growth.rs.
+   `FsOptions::legacy_unzeroed_root(true)` brings the old behavior back for
+   one filesystem instance. It exists so tests can build a volume damaged
+   the old way (core/vc-fs/tests/fat_root_repair.rs); nothing else sets it.
+   Vaults already damaged are repaired at mount by `vc_fs::fat_repair`.
 
 ## Removal condition
 
