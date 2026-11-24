@@ -49,6 +49,18 @@ pub fn scheme_display_name(name: String) -> String {
         .unwrap_or(name)
 }
 
+/// An unlock found and repaired a FAT32 top folder damaged by releases up to
+/// 2.0.0 (junk entries among the real ones). `damaged` holds the paths of
+/// files and folders whose data may be lost because a junk entry was deleted
+/// before the repair; a folder's path ends in `/`. It names at most 50, and
+/// `damaged_total` counts them all. Shells tell the user when it is not zero.
+#[derive(uniffi::Record)]
+pub struct RepairNotice {
+    pub junk_entries: u64,
+    pub damaged: Vec<String>,
+    pub damaged_total: u64,
+}
+
 /// The unlock "Hash" menu (2.0.0, issues #5 and #6): Auto, then each hash
 /// in VeraCrypt's PRF order. `label` is the hash's name for the menu.
 #[derive(uniffi::Record)]
@@ -961,6 +973,18 @@ impl VaultSession {
             bytes: r.bytes,
             renamed: r.renamed,
             skipped: r.skipped,
+        })
+    }
+
+    /// The repair this unlock made to an old FAT32 top folder, handed over
+    /// once; None when there was nothing to repair.
+    pub fn take_repair_report(&self) -> FfiResult<Option<RepairNotice>> {
+        with_session(&self.inner, |s| {
+            Ok(s.take_repair_report().map(|r| RepairNotice {
+                junk_entries: r.junk_entries,
+                damaged: r.damaged,
+                damaged_total: r.damaged_total,
+            }))
         })
     }
 

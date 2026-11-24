@@ -576,6 +576,13 @@ impl Session {
         self.vfs.space()
     }
 
+    /// What the mount-time repair of an old FAT32 top folder did
+    /// (`vc_fs::fat_repair`), handed over once. None when nothing was
+    /// repaired.
+    pub fn take_repair_report(&mut self) -> Option<vc_fs::fat_repair::RepairReport> {
+        self.vfs.take_repair_report()
+    }
+
     /// The filesystem's per-file size limit, if any (FAT: 4 GiB - 1).
     pub fn max_file_bytes(&self) -> Option<u64> {
         self.vfs.max_file_bytes()
