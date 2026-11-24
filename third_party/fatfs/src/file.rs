@@ -268,7 +268,12 @@ impl<'a, T: ReadWriteSeek> Write for File<'a, T> {
                 Some(n) => n,
                 None => {
                     // end of chain reached - allocate new cluster
-                    let new_cluster = self.fs.alloc_cluster(self.current_cluster, self.is_dir())?;
+                    // VaultPony local change (VAULTPONY.md, 6): the FAT32 root
+                    // directory is the one file without an entry of its own, so
+                    // is_dir() is false for it. Its new clusters must be zeroed
+                    // like any directory's.
+                    let zero = self.is_dir() || self.entry.is_none();
+                    let new_cluster = self.fs.alloc_cluster(self.current_cluster, zero)?;
                     trace!("allocated cluser {}", new_cluster);
                     if self.first_cluster.is_none() {
                         self.set_first_cluster(new_cluster);

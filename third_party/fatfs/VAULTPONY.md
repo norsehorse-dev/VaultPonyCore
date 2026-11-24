@@ -43,6 +43,17 @@ LICENSE.txt) and applied via `[patch.crates-io]` in the workspace root.
    the old instance's cached FSInfo is stale by then and must not overwrite
    the other process's.
 
+6. `src/file.rs`, `write`: a new cluster for the FAT32 root directory is
+   zeroed. Stock 0.3.6 zeroes a new cluster only when `is_dir()` is true,
+   and that reads the file's own directory entry, which the FAT32 root does
+   not have. Its new clusters were left as they were on disk. Inside an
+   encrypted container that is noise, so once the vault's top folder grew
+   past its first cluster it listed hundreds of junk files and folders, and
+   every later file needed another cluster because the junk left no free
+   run of entries. Subdirectories and FAT12/16 roots (a fixed area) were
+   never affected. Found while measuring import speed for 2.1.0; regression
+   test in core/vc-fs/tests/fat_root_growth.rs.
+
 ## Removal condition
 
 Delete this directory and the `[patch.crates-io]` entry when a fatfs
