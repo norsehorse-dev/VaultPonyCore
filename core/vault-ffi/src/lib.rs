@@ -25,6 +25,43 @@ pub fn core_version() -> String {
     vault_core::core_version()
 }
 
+/// What the container file's device did since the last `io_stats_reset`:
+/// counts, bytes and nanoseconds for reads, writes and syncs, and the time
+/// in the volume cipher. Process-wide, for measuring imports (2.1.0 plan 2).
+#[derive(uniffi::Record)]
+pub struct IoCounters {
+    pub reads: u64,
+    pub read_bytes: u64,
+    pub read_ns: u64,
+    pub writes: u64,
+    pub write_bytes: u64,
+    pub write_ns: u64,
+    pub syncs: u64,
+    pub sync_ns: u64,
+    pub cipher_ns: u64,
+}
+
+#[uniffi::export]
+pub fn io_stats() -> IoCounters {
+    let s = vc_io::stats::snapshot();
+    IoCounters {
+        reads: s.reads,
+        read_bytes: s.read_bytes,
+        read_ns: s.read_ns,
+        writes: s.writes,
+        write_bytes: s.write_bytes,
+        write_ns: s.write_ns,
+        syncs: s.syncs,
+        sync_ns: s.sync_ns,
+        cipher_ns: s.cipher_ns,
+    }
+}
+
+#[uniffi::export]
+pub fn io_stats_reset() {
+    vc_io::stats::reset();
+}
+
 /// Encryption schemes a new container can use, in menu order (single ciphers
 /// first, then cascades) — exactly the names `create_container` /
 /// `create_hidden_container` accept for `scheme`. Lets the shells populate a

@@ -62,7 +62,9 @@ impl BlockDevice for DecryptedDevice {
         let aligned_end = (abs + len).div_ceil(UNIT) * UNIT;
         let mut block = vec![0u8; (aligned_end - aligned_start) as usize];
         self.inner.read_at(aligned_start, &mut block)?;
+        let t = std::time::Instant::now();
         self.xts.decrypt_units(&mut block, aligned_start / UNIT);
+        vc_io::stats::add_cipher(t);
         let skip = (abs - aligned_start) as usize;
         buf.copy_from_slice(&block[skip..skip + buf.len()]);
         Ok(())
@@ -99,10 +101,14 @@ impl BlockDevice for DecryptedDevice {
             // reading the whole span keeps this simple and writes are
             // buffered by the FS layer anyway. Revisit if profiling says so.
             self.inner.read_at(aligned_start, &mut block)?;
+            let t = std::time::Instant::now();
             self.xts.decrypt_units(&mut block, first_unit);
+            vc_io::stats::add_cipher(t);
         }
         block[skip..skip + buf.len()].copy_from_slice(buf);
+        let t = std::time::Instant::now();
         self.xts.encrypt_units(&mut block, first_unit);
+        vc_io::stats::add_cipher(t);
         self.inner.write_at(aligned_start, &block)?;
         Ok(())
     }

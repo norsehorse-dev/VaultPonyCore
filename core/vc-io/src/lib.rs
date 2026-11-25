@@ -60,18 +60,112 @@ impl BlockDevice for FileDevice {
     // dup'd or passed fd shared with another process (the iOS File Provider
     // extension, rc3) can't move this device's reads and writes.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> VcResult<()> {
+        let t = std::time::Instant::now();
         pos::read_exact_at(&self.file, buf, offset)?;
+        stats::add_read(buf.len(), t);
         Ok(())
     }
 
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> VcResult<()> {
+        let t = std::time::Instant::now();
         pos::write_all_at(&self.file, buf, offset)?;
+        stats::add_write(buf.len(), t);
         Ok(())
     }
 
     fn flush(&mut self) -> VcResult<()> {
+        let t = std::time::Instant::now();
         self.file.sync_data()?;
+        stats::add_sync(t);
         Ok(())
+    }
+}
+
+/// Process-wide counters of what `FileDevice` did and how long it took, for
+/// measuring where a batch import spends its time (2.1.0 plan 2). Counts
+/// and durations only: no offsets, names or data.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    use std::time::Instant;
+
+    static READS: AtomicU64 = AtomicU64::new(0);
+    static READ_BYTES: AtomicU64 = AtomicU64::new(0);
+    static READ_NS: AtomicU64 = AtomicU64::new(0);
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+    static WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+    static WRITE_NS: AtomicU64 = AtomicU64::new(0);
+    static SYNCS: AtomicU64 = AtomicU64::new(0);
+    static SYNC_NS: AtomicU64 = AtomicU64::new(0);
+    static CIPHER_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct IoStats {
+        pub reads: u64,
+        pub read_bytes: u64,
+        pub read_ns: u64,
+        pub writes: u64,
+        pub write_bytes: u64,
+        pub write_ns: u64,
+        pub syncs: u64,
+        pub sync_ns: u64,
+        /// Time in the volume cipher (XTS), reported by the layer above.
+        pub cipher_ns: u64,
+    }
+
+    fn ns(since: Instant) -> u64 {
+        since.elapsed().as_nanos() as u64
+    }
+
+    pub(crate) fn add_read(bytes: usize, since: Instant) {
+        READS.fetch_add(1, Relaxed);
+        READ_BYTES.fetch_add(bytes as u64, Relaxed);
+        READ_NS.fetch_add(ns(since), Relaxed);
+    }
+
+    pub(crate) fn add_write(bytes: usize, since: Instant) {
+        WRITES.fetch_add(1, Relaxed);
+        WRITE_BYTES.fetch_add(bytes as u64, Relaxed);
+        WRITE_NS.fetch_add(ns(since), Relaxed);
+    }
+
+    pub(crate) fn add_sync(since: Instant) {
+        SYNCS.fetch_add(1, Relaxed);
+        SYNC_NS.fetch_add(ns(since), Relaxed);
+    }
+
+    /// Time spent encrypting or decrypting since `since`.
+    pub fn add_cipher(since: Instant) {
+        CIPHER_NS.fetch_add(ns(since), Relaxed);
+    }
+
+    pub fn snapshot() -> IoStats {
+        IoStats {
+            reads: READS.load(Relaxed),
+            read_bytes: READ_BYTES.load(Relaxed),
+            read_ns: READ_NS.load(Relaxed),
+            writes: WRITES.load(Relaxed),
+            write_bytes: WRITE_BYTES.load(Relaxed),
+            write_ns: WRITE_NS.load(Relaxed),
+            syncs: SYNCS.load(Relaxed),
+            sync_ns: SYNC_NS.load(Relaxed),
+            cipher_ns: CIPHER_NS.load(Relaxed),
+        }
+    }
+
+    pub fn reset() {
+        for c in [
+            &READS,
+            &READ_BYTES,
+            &READ_NS,
+            &WRITES,
+            &WRITE_BYTES,
+            &WRITE_NS,
+            &SYNCS,
+            &SYNC_NS,
+            &CIPHER_NS,
+        ] {
+            c.store(0, Relaxed);
+        }
     }
 }
 
