@@ -14,6 +14,7 @@ fatfs = { workspace = true }
 ntfs = { workspace = true }
 ext4-view = { workspace = true }
 log = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
