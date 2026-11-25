@@ -1,0 +1,9 @@
+# The aes crate (0.8) uses the ARMv8 AES instructions on arm64 only when
+# this cfg is set; without it AES runs in software there. With it, the crate
+# checks the CPU at run time and falls back to software. It has no effect on
+# other architectures.
+#
+# A RUSTFLAGS environment variable replaces these flags, so a build that sets
+# one (the Android Gradle build does) has to pass the cfg itself.
+[target.'cfg(target_arch = "aarch64")']
+rustflags = ["--cfg", "aes_armv8"]
